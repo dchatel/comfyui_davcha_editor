@@ -143,6 +143,20 @@ let activeEditor = null
 window.addEventListener("keydown", (e) => activeEditor?.onKey(e, true), true)
 window.addEventListener("keyup", (e) => activeEditor?.onKey(e, false), true)
 
+// ComfyUI pastes a picture into the selected node only when it is also the canvas' current node,
+// which a pinned node doesn't become when clicked: it adds a new Load Image instead (frontend
+// issue #9899). This sends the picture to the one selected node that takes files, as ComfyUI
+// does otherwise. Nothing pastes while the editor is open, as the graph is behind it.
+document.addEventListener("paste", (e) => {
+    if (e.target.closest?.("input, textarea, [contenteditable]")) return
+    if (activeEditor) return e.preventDefault()
+    const files = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith("image/"))
+    const selected = [...(app.canvas?.selectedItems ?? [])]
+    if (!files.length || selected.length !== 1 || typeof selected[0].pasteFiles !== "function") return
+    e.preventDefault()
+    selected[0].pasteFiles(files)
+}, true)
+
 // Strokes use it to turn their gray coverage map into alpha. sRGB keeps the gray values as they are.
 document.body.insertAdjacentHTML("beforeend", '<svg width="0" height="0" style="position: absolute"><filter id="davcha-luminance-to-alpha" color-interpolation-filters="sRGB"><feColorMatrix type="luminanceToAlpha"/></filter></svg>')
 
@@ -2116,6 +2130,7 @@ function setupGallery(node) {
         addFiles([...e.dataTransfer.files])
         return true
     }
+    node.pasteFiles = addFiles
     node.renderGallery = render
     render()
 }

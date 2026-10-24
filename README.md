@@ -24,7 +24,8 @@ they show as unavailable in the menu.
 
 ### Load Image (Editor)
 
-Works like the core Load Image: pick or upload a picture, and it outputs `IMAGE` and `MASK`.
+Works like the core Load Image: pick, upload or paste (Ctrl+V) a picture, and it outputs
+`IMAGE` and `MASK`. Pasting a new picture starts a new edit.
 The **Edit** button, or **Open in editor** in the node menu, opens the editor. Once edited,
 the button shows the output size, and the node preview shows the edited picture.
 
@@ -40,6 +41,14 @@ pictures can have different sizes.
 - Click a picture to edit it. The ✎ badge marks edited pictures.
 - Drag a picture onto another to move it to that place.
 - Hover a picture and click **×** to remove it.
+- Select the node and press Ctrl+V to add the picture in the clipboard.
+
+### Pasting into pinned nodes
+
+ComfyUI adds a new Load Image instead of pasting into the selected one when that node is
+pinned ([ComfyUI_frontend#9899](https://github.com/Comfy-Org/ComfyUI_frontend/issues/9899)).
+This extension sends the pasted picture to the selected node instead, for these nodes and for
+the core Load Image as well.
 
 ## The editor
 
