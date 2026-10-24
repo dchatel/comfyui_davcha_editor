@@ -176,11 +176,20 @@ const DEFAULT_RECIPES = [
     { name: "Normal map (BAE)", node: "AIO_Preprocessor", inputs: { preprocessor: "BAE-NormalMapPreprocessor", resolution: 1024 } },
 ]
 
+// Returns [label, recipes] groups: the recipes above, then every preprocessor AIO_Preprocessor
+// offers, read from the node itself so the list follows the installed controlnet_aux.
 async function loadRecipes() {
     const recipes = new Map(DEFAULT_RECIPES.map((r) => [r.name, r]))
     const res = await api.fetchApi(`/userdata/${encodeURIComponent("davcha_editor/recipes.json")}`)
     if (res.ok) for (const r of await res.json()) recipes.set(r.name, r)
-    return [...recipes.values()]
+    const groups = [["Recipes", [...recipes.values()]]]
+    if (LiteGraph.registered_node_types.AIO_Preprocessor) {
+        const { AIO_Preprocessor } = await (await api.fetchApi("/object_info/AIO_Preprocessor")).json()
+        const spec = { ...AIO_Preprocessor.input.required, ...AIO_Preprocessor.input.optional }.preprocessor
+        const options = (Array.isArray(spec[0]) ? spec[0] : spec[1].options).filter((p) => p !== "none")
+        groups.push(["All AIO preprocessors", options.map((p) => ({ name: p, node: "AIO_Preprocessor", inputs: { preprocessor: p, resolution: 1024 } }))])
+    }
+    return groups
 }
 
 // Queues a three-node prompt (load the picture, run the recipe, preview the result) like the Run
@@ -362,22 +371,27 @@ class Editor {
         this.syncBrushInputs()
         this.setMaskView(this.maskView)
         const add = this.root.querySelector(".dl-add")
+        this.recipes = []
         loadRecipes()
-            .then((recipes) => {
-                this.recipes = recipes
-                // A recipe whose node isn't installed, or failed to load, shows which one it needs.
-                for (const recipe of recipes) {
-                    const option = new Option(recipe.name, recipe.name)
-                    if (!LiteGraph.registered_node_types[recipe.node]) {
-                        option.disabled = true
-                        option.textContent += ` (needs ${recipe.node})`
+            .then((groups) => {
+                for (const [label, recipes] of groups) {
+                    const group = Object.assign(document.createElement("optgroup"), { label })
+                    // A recipe whose node isn't installed, or failed to load, shows which one it needs.
+                    for (const recipe of recipes) {
+                        const option = new Option(recipe.name, this.recipes.length)
+                        this.recipes.push(recipe)
+                        if (!LiteGraph.registered_node_types[recipe.node]) {
+                            option.disabled = true
+                            option.textContent += ` (needs ${recipe.node})`
+                        }
+                        group.append(option)
                     }
-                    add.append(option)
+                    add.append(group)
                 }
             })
             .catch(showError)
         add.addEventListener("change", () => {
-            const recipe = this.recipes.find((r) => r.name === add.value)
+            const recipe = this.recipes[Number(add.value)]
             add.value = ""
             this.addFromRecipe(recipe)
         })
