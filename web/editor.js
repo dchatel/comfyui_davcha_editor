@@ -71,12 +71,32 @@ const HELP = {
     hand: "Drag: pan",
 }
 
+const ICONS = Object.fromEntries(Object.entries({
+    crop: '<path d="M6 2v16h16M2 6h16v16"/>',
+    brush: '<path d="M21 3 11.5 12.5"/><path d="M11.5 12.5c-2.5-1.5-5.5 0-5.5 3 0 1.5-1 3-3 4.5 4.5 1 9.5-.5 8.5-7.5z"/>',
+    eraser: '<path d="M3 15 13 5l6 6-10 10H8z"/><path d="m8 10 6 6M10 21h11"/>',
+    pose: '<circle cx="12" cy="4" r="2"/><path d="M5 10l7-2 7 2M12 8v6l-4 7M12 14l4 7"/>',
+    hand: '<path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V11M11 11V4a1.5 1.5 0 0 1 3 0v7M14 11V5.5a1.5 1.5 0 0 1 3 0V12M17 12V8.5a1.5 1.5 0 0 1 3 0V14a7 7 0 0 1-7 7h-1a6 6 0 0 1-5-2.7l-3-4.8a1.5 1.5 0 0 1 2.5-1.7L8 13"/>',
+    undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-4"/>',
+    redo: '<path d="m15 14 5-5-5-5"/><path d="M20 9H9a5 5 0 0 0 0 10h4"/>',
+    mask: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="12" cy="12" r="5" fill="currentColor"/>',
+    paint: '<path d="M12 3s6 7 6 11a6 6 0 0 1-12 0c0-4 6-11 6-11z"/>',
+}).map(([name, paths]) => [name, `<svg viewBox="0 0 24 24">${paths}</svg>`]))
+
 const STYLE = `
 .davcha-editor { position: fixed; inset: 0; z-index: 10000; display: flex; flex-direction: column; background: #151515; color: #ddd; font: 13px sans-serif; }
-.davcha-editor .de-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; background: #222; border-bottom: 1px solid #333; white-space: nowrap; }
+.davcha-editor .de-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #222; border-bottom: 1px solid #333; white-space: nowrap; }
 .davcha-editor .de-grow { flex: 1; }
 .davcha-editor .de-sep { width: 1px; align-self: stretch; background: #3a3a3a; }
-.davcha-editor .de-options { display: flex; align-items: center; gap: 8px; }
+.davcha-editor .de-body { display: flex; flex: 1; min-height: 0; }
+.davcha-editor .de-panel { width: 290px; display: flex; flex-direction: column; gap: 6px; padding: 8px; overflow-y: auto; background: #1d1d1d; border-left: 1px solid #333; }
+.davcha-editor .de-panel-title { font-weight: bold; color: #aaa; margin-top: 4px; }
+.davcha-editor .de-tools { display: flex; gap: 4px; }
+.davcha-editor button.de-icon { display: inline-flex; align-items: center; justify-content: center; padding: 3px 6px; }
+.davcha-editor button svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
+.davcha-editor .de-options { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.davcha-editor .de-options label { flex-basis: 100%; display: flex; align-items: center; justify-content: space-between; }
+.davcha-editor .de-size { color: #888; }
 .davcha-editor input[type=number] { width: 56px; background: linear-gradient(to right, #2c4466 var(--fill, 0%), #111 var(--fill, 0%)); color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; }
 .davcha-editor label.de-scrub { cursor: ew-resize; user-select: none; }
 .davcha-editor select { background: #111; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; }
@@ -89,8 +109,6 @@ const STYLE = `
 .davcha-editor .de-stage { position: relative; flex: 1; min-height: 0; }
 .davcha-editor .de-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; outline: none; }
 .davcha-editor .de-help { padding: 4px 10px; color: #888; font-size: 12px; background: #1b1b1b; border-top: 1px solid #333; }
-.davcha-editor .de-layers { position: absolute; top: 8px; right: 8px; width: 250px; display: flex; flex-direction: column; gap: 4px; padding: 6px; background: rgba(34, 34, 34, 0.92); border: 1px solid #3a3a3a; border-radius: 6px; }
-.davcha-editor .dl-title { font-weight: bold; color: #aaa; }
 .davcha-editor .dl-status { color: #8ab4f8; font-size: 12px; }
 .davcha-editor .dl-status:empty { display: none; }
 .davcha-editor .dl-row { display: flex; align-items: center; gap: 4px; padding: 2px 4px; border-radius: 4px; }
@@ -410,37 +428,43 @@ class Editor {
         this.root.className = "davcha-editor"
         this.root.innerHTML = `
 <div class="de-bar">
-  <button data-tool="crop" title="Crop, pad and rotate (C)">Crop</button><button data-tool="brush" title="Brush (B)">Brush</button><button data-tool="eraser" title="Eraser (E)">Eraser</button><button data-tool="pose" title="Edit pose layers (P)">Pose</button><button data-tool="hand" title="Pan (H)">Hand</button>
-  <span class="de-sep"></span>
-  <span class="de-options" data-for="crop">
-    <label>Rotate <input class="de-rotate" type="number" step="0.1"></label>
-    <button data-action="ccw">⟲ 90°</button><button data-action="cw">⟳ 90°</button>
-    <label>Fill <input class="de-fill" type="color"></label>
-  </span>
-  <span class="de-options" data-for="pose">
-    <button data-pose-mode="move" title="Drag moves the selected points (R)">Move</button><button data-pose-mode="rotate" title="Drag turns the selected points about their nearest unselected common parent (R)">Rotate</button>
-    <button data-action="add-person" title="Add a standing person, in a new pose layer if there is none">Add person</button><button data-action="delete-person" title="Delete the people with selected points (Del)">Delete person</button>
-  </span>
-  <span class="de-options" data-for="brush eraser">
-    <button data-target="mask" title="Paint on the mask (M)">Mask</button><button data-target="paint" title="Paint on the picture (M)">Paint</button>
-    <input class="de-color" type="color" title="Paint color">
-    <label>Size <input class="de-size-input" type="number" min="1" max="2000"></label>
-    <label>Opacity <input class="de-opacity" type="number" min="1" max="100"></label>
-    <label>Hardness <input class="de-hardness" type="number" min="0" max="100"></label>
-    <button data-action="clear" title="Clear the current layer">Clear</button><button data-action="invert" title="Invert the mask (Ctrl+I)">Invert mask</button>
-    <span class="de-sep"></span>
-    <label><input class="de-show-mask" type="checkbox"> Show mask</label>
-    <select class="de-mask-view" title="Mask preview (Q)">${MASK_VIEWS.map((v) => `<option>${v}</option>`).join("")}</select>
-    <input class="de-mask-color" type="color" title="Mask preview color">
-    <label title="Preview only: the mask keeps its own values">Preview <input class="de-mask-opacity" type="number" min="0" max="100"></label>
-  </span>
-  <span class="de-size"></span>
+  <label title="Show the mask (Shift+Q)"><input class="de-show-mask" type="checkbox"> Mask preview</label>
+  <select class="de-mask-view" title="Mask preview (Q)">${MASK_VIEWS.map((v) => `<option>${v}</option>`).join("")}</select>
+  <input class="de-mask-color" type="color" title="Mask preview color">
+  <label title="Preview only: the mask keeps its own values">Opacity <input class="de-mask-opacity" type="number" min="0" max="100"></label>
   <span class="de-grow"></span>
-  <button data-action="undo" title="Undo (Ctrl+Z)">↶</button><button data-action="redo" title="Redo (Ctrl+Y)">↷</button>
-  <button data-action="reset">Reset</button><button data-action="cancel">Cancel</button><button data-action="apply" class="de-primary">Apply</button>
+  <button class="de-icon" data-action="undo" title="Undo (Ctrl+Z)">${ICONS.undo}</button><button class="de-icon" data-action="redo" title="Redo (Ctrl+Y)">${ICONS.redo}</button>
+  <span class="de-sep"></span>
+  <button data-action="reset" title="Undo every edit">Reset</button><button data-action="cancel" title="Close without applying (Esc)">Cancel</button><button data-action="apply" class="de-primary" title="Enter">Apply</button>
 </div>
-<div class="de-stage"><canvas class="de-main"></canvas><canvas class="de-overlay" tabindex="0"></canvas>
-  <div class="de-layers"><div class="dl-title">Layers</div><select class="dl-add"><option value="">Add from recipe…</option></select><div class="dl-status"></div><div class="dl-list"></div></div>
+<div class="de-body">
+  <div class="de-stage"><canvas class="de-main"></canvas><canvas class="de-overlay" tabindex="0"></canvas></div>
+  <div class="de-panel">
+    <div class="de-tools">
+      <button class="de-icon" data-tool="crop" title="Crop, pad and rotate (C)">${ICONS.crop}</button><button class="de-icon" data-tool="brush" title="Brush (B)">${ICONS.brush}</button><button class="de-icon" data-tool="eraser" title="Eraser (E)">${ICONS.eraser}</button><button class="de-icon" data-tool="pose" title="Edit pose layers (P)">${ICONS.pose}</button><button class="de-icon" data-tool="hand" title="Pan (H)">${ICONS.hand}</button>
+    </div>
+    <div class="de-panel-title de-tool-name"></div>
+    <div class="de-options" data-for="crop">
+      <label>Rotate <input class="de-rotate" type="number" step="0.1"></label>
+      <button data-action="ccw">⟲ 90°</button><button data-action="cw">⟳ 90°</button>
+      <label>Fill <input class="de-fill" type="color"></label>
+      <span class="de-size"></span>
+    </div>
+    <div class="de-options" data-for="pose">
+      <button data-pose-mode="move" title="Drag moves the selected points (R)">Move</button><button data-pose-mode="rotate" title="Drag turns the selected points about their nearest unselected common parent (R)">Rotate</button>
+      <button data-action="add-person" title="Add a standing person, in a new pose layer if there is none">Add person</button><button data-action="delete-person" title="Delete the people with selected points (Del)">Delete person</button>
+    </div>
+    <div class="de-options" data-for="brush eraser">
+      <button class="de-icon" data-target="mask" title="Paint on the mask (M)">${ICONS.mask}</button><button class="de-icon" data-target="paint" title="Paint on the picture (M)">${ICONS.paint}</button>
+      <input class="de-color" type="color" title="Paint color">
+      <label>Size <input class="de-size-input" type="number" min="1" max="2000"></label>
+      <label>Opacity <input class="de-opacity" type="number" min="1" max="100"></label>
+      <label>Hardness <input class="de-hardness" type="number" min="0" max="100"></label>
+      <button data-action="clear" title="Clear the current layer">Clear</button><button data-action="invert" title="Invert the mask (Ctrl+I)">Invert mask</button>
+    </div>
+    <div class="de-panel-title">Layers</div>
+    <select class="dl-add"><option value="">Add from recipe…</option></select><div class="dl-status"></div><div class="dl-list"></div>
+  </div>
 </div>
 <div class="de-help"></div>`
         this.main = this.root.querySelector(".de-main")
@@ -494,7 +518,7 @@ class Editor {
             this.addFromRecipe(recipe)
         })
 
-        this.root.querySelector(".de-bar").addEventListener("click", (e) => {
+        this.root.addEventListener("click", (e) => {
             const { action, tool, target, poseMode } = e.target.dataset ?? {}
             if (tool) this.setTool(tool)
             else if (poseMode) this.setPoseMode(poseMode)
@@ -590,6 +614,7 @@ class Editor {
     setTool(tool) {
         this.tool = tool
         for (const b of this.root.querySelectorAll("[data-tool]")) b.classList.toggle("de-active", b.dataset.tool === tool)
+        this.root.querySelector(".de-tool-name").textContent = this.root.querySelector(`[data-tool=${tool}]`).title.replace(/ \(.\)$/, "")
         for (const o of this.root.querySelectorAll(".de-options")) o.style.display = o.dataset.for.split(" ").includes(tool) ? "" : "none"
         this.help.textContent = `${HELP[tool]} · Wheel: zoom · Space or middle drag: pan · C B E P H: tools · Ctrl+Z / Ctrl+Y: undo / redo · Ctrl+0: fit · Enter: apply · Esc: cancel`
         this.setTarget(this.target)
