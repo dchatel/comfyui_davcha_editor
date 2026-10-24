@@ -67,6 +67,7 @@ const HELP = {
     crop: "Frame edges: crop or pad (Shift: keep ratio, Alt: from center) · Inside: move · Outside: rotate (Shift: 15° steps)",
     brush: "Alt+wheel: size · Shift+wheel: opacity · Ctrl+wheel: hardness · M: mask/paint · Q: mask preview · Shift+Q: show/hide mask · Ctrl+I: invert mask",
     eraser: "Alt+wheel: size · Shift+wheel: opacity · Ctrl+wheel: hardness · M: mask/paint · Q: mask preview · Shift+Q: show/hide mask · Ctrl+I: invert mask",
+    pose: "Drag a joint to move it (hands and face follow), a limb to move the person · Del: delete the selected person",
     hand: "Drag: pan",
 }
 
@@ -108,9 +109,8 @@ const STYLE = `
 .davcha-gallery .dg-add { display: flex; align-items: center; justify-content: center; border-style: dashed; color: #888; font-size: 28px; }
 `
 document.head.append(Object.assign(document.createElement("style"), { textContent: STYLE }))
-// The open editor takes every key before the rest of the page: ComfyUI's own window listeners
-// would also act on the graph, Ctrl+Z undoing it for one. Registering when the module loads puts
-// this ahead of them.
+// The open editor takes every key, and stops it there for the page's other listeners. ComfyUI's
+// change tracker listens ahead of it; the editor turns that one off while open (see build).
 let activeEditor = null
 window.addEventListener("keydown", (e) => activeEditor?.onKey(e, true), true)
 window.addEventListener("keyup", (e) => activeEditor?.onKey(e, false), true)
@@ -173,6 +173,11 @@ const DEFAULT_RECIPES = [
     { name: "Soft edges (HED)", node: "AIO_Preprocessor", inputs: { preprocessor: "HEDPreprocessor", resolution: 1024 } },
     { name: "Scribble", node: "AIO_Preprocessor", inputs: { preprocessor: "ScribblePreprocessor", resolution: 1024 } },
     { name: "Pose (DWPose)", node: "AIO_Preprocessor", inputs: { preprocessor: "DWPreprocessor", resolution: 1024 } },
+    // `pose` is the node output holding the OpenPose keypoints: the layer keeps them, editable.
+    {
+        name: "Pose (DWPose, editable)", node: "DWPreprocessor", pose: 1,
+        inputs: { detect_hand: "enable", detect_body: "enable", detect_face: "enable", resolution: 1024, bbox_detector: "yolox_l.onnx", pose_estimator: "dw-ll_ucoco_384_bs5.torchscript.pt", scale_stick_for_xinsr_cn: "disable" },
+    },
     { name: "Normal map (BAE)", node: "AIO_Preprocessor", inputs: { preprocessor: "BAE-NormalMapPreprocessor", resolution: 1024 } },
 ]
 
@@ -195,6 +200,7 @@ async function loadRecipes() {
 // Queues a three-node prompt (load the picture, run the recipe, preview the result) like the Run
 // button does, so the run shares ComfyUI's queue, cache and memory management. The prompt's node
 // ids match nothing on the graph, and the run is removed from the history once its result is read.
+// Returns the result picture, or for a pose recipe the OpenPose dict PreviewAny shows as JSON.
 async function runRecipe(image, recipe) {
     const finished = new Map()
     let promptId = null
@@ -209,7 +215,9 @@ async function runRecipe(image, recipe) {
         const prompt = {
             dpp_load: { class_type: "LoadImage", inputs: { image } },
             dpp_run: { class_type: recipe.node, inputs: { ...recipe.inputs, image: ["dpp_load", 0] } },
-            dpp_out: { class_type: "PreviewImage", inputs: { images: ["dpp_run", 0] } },
+            dpp_out: recipe.pose === undefined
+                ? { class_type: "PreviewImage", inputs: { images: ["dpp_run", 0] } }
+                : { class_type: "PreviewAny", inputs: { source: ["dpp_run", recipe.pose] } },
         }
         const res = await api.fetchApi("/prompt", { method: "POST", body: JSON.stringify({ prompt, client_id: api.clientId, front: true }) })
         const queued = await res.json()
@@ -221,11 +229,91 @@ async function runRecipe(image, recipe) {
         if (!finished.has(promptId)) await new Promise((resolve) => (settle = resolve))
         if (finished.get(promptId)) throw new Error(finished.get(promptId))
         const history = await (await api.fetchApi(`/history/${promptId}`)).json()
-        const { filename, subfolder, type } = history[promptId].outputs.dpp_out.images[0]
+        const output = history[promptId].outputs.dpp_out
         await api.fetchApi("/history", { method: "POST", body: JSON.stringify({ delete: [promptId] }) })
+        if (recipe.pose !== undefined) return JSON.parse(output.text[0])[0]
+        const { filename, subfolder, type } = output.images[0]
         return loadImage(`${subfolder ? `${subfolder}/` : ""}${filename} [${type}]`)
     } finally {
         for (const type of events) api.removeEventListener(type, onEvent)
+    }
+}
+
+// OpenPose body points: nose, neck, right shoulder, elbow, wrist, left shoulder, elbow, wrist,
+// right hip, knee, ankle, left hip, knee, ankle, right eye, left eye, right ear, left ear.
+// Limbs, colors and sizes follow controlnet_aux's drawing, so ControlNets read the layer the same way.
+const POSE_LIMBS = [[1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8], [8, 9], [9, 10], [1, 11], [11, 12], [12, 13], [1, 0], [0, 14], [14, 16], [0, 15], [15, 17]]
+const POSE_COLORS = [[255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0], [170, 255, 0], [85, 255, 0], [0, 255, 0], [0, 255, 85], [0, 255, 170], [0, 255, 255], [0, 170, 255], [0, 85, 255], [0, 0, 255], [85, 0, 255], [170, 0, 255], [255, 0, 255], [255, 0, 170], [255, 0, 85]]
+const HAND_EDGES = [[0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8], [0, 9], [9, 10], [10, 11], [11, 12], [0, 13], [13, 14], [14, 15], [15, 16], [0, 17], [17, 18], [18, 19], [19, 20]]
+// The part that moves along with a body point: hands with their wrist, the face with the nose.
+const POSE_ATTACHED = { 4: "rightHand", 7: "leftHand", 0: "face" }
+// A standing person facing the viewer, in a 1×1 box.
+const DEFAULT_BODY = [[0.5, 0.12], [0.5, 0.22], [0.38, 0.22], [0.33, 0.38], [0.3, 0.52], [0.62, 0.22], [0.67, 0.38], [0.7, 0.52], [0.43, 0.52], [0.42, 0.74], [0.41, 0.95], [0.57, 0.52], [0.58, 0.74], [0.59, 0.95], [0.47, 0.1], [0.53, 0.1], [0.44, 0.11], [0.56, 0.11]]
+
+const rgb = ([r, g, b], k = 1) => `rgb(${Math.round(r * k)}, ${Math.round(g * k)}, ${Math.round(b * k)})`
+
+function hue(h) {
+    const f = (n) => {
+        const k = (n + h * 6) % 6
+        return 255 * (1 - Math.max(0, Math.min(k, 4 - k, 1)))
+    }
+    return [f(5), f(3), f(1)]
+}
+
+// People from an OpenPose dict, in picture pixels: {body, leftHand, rightHand, face}, each a
+// list of [x, y] or null for a point that wasn't found. The dict's points are either normalized
+// or in canvas pixels, as controlnet_aux allows both.
+function readPoses({ people, canvas_width, canvas_height }, W, H) {
+    const lists = people.flatMap((p) => [p.pose_keypoints_2d, p.hand_left_keypoints_2d, p.hand_right_keypoints_2d, p.face_keypoints_2d]).filter(Boolean)
+    const normalized = lists.every((k) => k.every((v, i) => i % 3 === 2 || Math.abs(v) <= 1))
+    const sx = normalized ? W : W / canvas_width
+    const sy = normalized ? H : H / canvas_height
+    const points = (k) => k && Array.from({ length: k.length / 3 }, (_, i) => (k[i * 3 + 2] > 0 && k[i * 3] > 0 && k[i * 3 + 1] > 0 ? [k[i * 3] * sx, k[i * 3 + 1] * sy] : null))
+    return people.map((p) => ({ body: points(p.pose_keypoints_2d) ?? Array(18).fill(null), leftHand: points(p.hand_left_keypoints_2d), rightHand: points(p.hand_right_keypoints_2d), face: points(p.face_keypoints_2d) }))
+}
+
+function defaultPerson(W, H) {
+    const h = 0.8 * Math.min(H, W * 1.5)
+    const top = (H - h) / 2
+    return { body: DEFAULT_BODY.map(([x, y]) => [W / 2 + (x - 0.5) * h, top + y * h]), leftHand: null, rightHand: null, face: null }
+}
+
+// Sizes are in picture pixels whatever the picture's size, as DWPose draws at the picture's size.
+function drawPoses(ctx, people, W, H) {
+    const dot = (x, y, r, color) => {
+        ctx.fillStyle = color
+        ctx.beginPath()
+        ctx.arc(x, y, r, 0, Math.PI * 2)
+        ctx.fill()
+    }
+    ctx.fillStyle = "#000000"
+    ctx.fillRect(0, 0, W, H)
+    for (const { body } of people) {
+        POSE_LIMBS.forEach(([a, b], i) => {
+            const [p, q] = [body[a], body[b]]
+            if (!p || !q) return
+            ctx.fillStyle = rgb(POSE_COLORS[i], 0.6)
+            ctx.beginPath()
+            ctx.ellipse((p[0] + q[0]) / 2, (p[1] + q[1]) / 2, Math.hypot(q[0] - p[0], q[1] - p[1]) / 2, 4, Math.atan2(q[1] - p[1], q[0] - p[0]), 0, Math.PI * 2)
+            ctx.fill()
+        })
+        body.forEach((p, i) => p && dot(p[0], p[1], 4, rgb(POSE_COLORS[i])))
+    }
+    ctx.lineWidth = 2
+    for (const person of people) {
+        for (const hand of [person.leftHand, person.rightHand]) {
+            if (!hand) continue
+            HAND_EDGES.forEach(([a, b], i) => {
+                if (!hand[a] || !hand[b]) return
+                ctx.strokeStyle = rgb(hue(i / HAND_EDGES.length))
+                ctx.beginPath()
+                ctx.moveTo(...hand[a])
+                ctx.lineTo(...hand[b])
+                ctx.stroke()
+            })
+            for (const p of hand) p && dot(p[0], p[1], 4, "rgb(0, 0, 255)")
+        }
+        for (const p of person.face ?? []) p && dot(p[0], p[1], 3, "#ffffff")
     }
 }
 
@@ -299,6 +387,8 @@ class Editor {
         this.mouse = null
         this.hud = null
         this.sizeNotches = 0
+        this.posePerson = null
+        this.poseHover = null
         this.build()
         this.setTool("crop")
         this.fit()
@@ -316,12 +406,15 @@ class Editor {
         this.root.className = "davcha-editor"
         this.root.innerHTML = `
 <div class="de-bar">
-  <button data-tool="crop" title="Crop, pad and rotate (C)">Crop</button><button data-tool="brush" title="Brush (B)">Brush</button><button data-tool="eraser" title="Eraser (E)">Eraser</button><button data-tool="hand" title="Pan (H)">Hand</button>
+  <button data-tool="crop" title="Crop, pad and rotate (C)">Crop</button><button data-tool="brush" title="Brush (B)">Brush</button><button data-tool="eraser" title="Eraser (E)">Eraser</button><button data-tool="pose" title="Edit pose layers (P)">Pose</button><button data-tool="hand" title="Pan (H)">Hand</button>
   <span class="de-sep"></span>
   <span class="de-options" data-for="crop">
     <label>Rotate <input class="de-rotate" type="number" step="0.1"></label>
     <button data-action="ccw">⟲ 90°</button><button data-action="cw">⟳ 90°</button>
     <label>Fill <input class="de-fill" type="color"></label>
+  </span>
+  <span class="de-options" data-for="pose">
+    <button data-action="add-person" title="Add a standing person, in a new pose layer if there is none">Add person</button><button data-action="delete-person" title="Delete the selected person (Del)">Delete person</button>
   </span>
   <span class="de-options" data-for="brush eraser">
     <button data-target="mask" title="Paint on the mask (M)">Mask</button><button data-target="paint" title="Paint on the picture (M)">Paint</button>
@@ -403,6 +496,8 @@ class Editor {
             else if (action === "cw" || action === "ccw") this.quarterTurn(action === "cw")
             else if (action === "clear") this.clearLayer()
             else if (action === "invert") this.invertMask()
+            else if (action === "add-person") this.addPerson()
+            else if (action === "delete-person") this.deletePerson()
             else if (action === "undo") this.undo()
             else if (action === "redo") this.redo()
             else if (action === "reset") this.reset()
@@ -467,6 +562,10 @@ class Editor {
         this.canvas.addEventListener("wheel", (e) => this.onWheel(e), { passive: false })
         this.canvas.addEventListener("contextmenu", (e) => e.preventDefault())
         activeEditor = this
+        // ComfyUI's change tracker sees keys before the editor and would act on the graph, Ctrl+Z
+        // undoing it. It stands aside while a mask editor says it is open, which this editor is.
+        this.maskEditorOpened = app.constructor.maskeditor_is_opended
+        app.constructor.maskeditor_is_opended = () => true
 
         document.body.append(this.root)
         this.resize = new ResizeObserver(() => {
@@ -486,7 +585,7 @@ class Editor {
         this.tool = tool
         for (const b of this.root.querySelectorAll("[data-tool]")) b.classList.toggle("de-active", b.dataset.tool === tool)
         for (const o of this.root.querySelectorAll(".de-options")) o.style.display = o.dataset.for.split(" ").includes(tool) ? "" : "none"
-        this.help.textContent = `${HELP[tool]} · Wheel: zoom · Space or middle drag: pan · C B E H: tools · Ctrl+Z / Ctrl+Y: undo / redo · Ctrl+0: fit · Enter: apply · Esc: cancel`
+        this.help.textContent = `${HELP[tool]} · Wheel: zoom · Space or middle drag: pan · C B E P H: tools · Ctrl+Z / Ctrl+Y: undo / redo · Ctrl+0: fit · Enter: apply · Esc: cancel`
         this.setTarget(this.target)
         this.updateCursor()
         this.redraw()
@@ -499,12 +598,34 @@ class Editor {
         this.renderLayers()
     }
 
-    // A recipe layer: its result stretched over the picture, which is where the recipe ran.
-    newLayer({ name, recipe, visible = true, opacity = 1 }, result) {
+    // A recipe layer: its result stretched over the picture, which is where the recipe ran. A pose
+    // layer keeps its people instead, and is drawn from them.
+    newLayer({ name, recipe, visible = true, opacity = 1, pose }, result) {
         const canvas = this.newCanvas()
         const ctx = canvas.getContext("2d")
-        ctx.drawImage(result, 0, 0, this.W, this.H)
-        return { id: `layer${this.nextLayer++}`, canvas, ctx, used: true, name, recipe, visible, opacity }
+        const layer = { id: `layer${this.nextLayer++}`, canvas, ctx, used: true, name, recipe, visible, opacity, pose }
+        if (pose) drawPoses(ctx, pose, this.W, this.H)
+        else ctx.drawImage(result, 0, 0, this.W, this.H)
+        return layer
+    }
+
+    applyPose(layer, people) {
+        layer.pose = people
+        drawPoses(layer.ctx, people, this.W, this.H)
+    }
+
+    // People lists in the history are never changed afterwards: an edit works on a copy.
+    pushPose(layer, before) {
+        const after = layer.pose
+        this.push({ undo: () => this.applyPose(layer, before), redo: () => this.applyPose(layer, after) })
+    }
+
+    setPose(layer, people) {
+        const before = layer.pose
+        this.applyPose(layer, people)
+        this.pushPose(layer, before)
+        this.renderLayers()
+        this.redraw()
     }
 
     insertLayer(layer, index) {
@@ -523,7 +644,8 @@ class Editor {
     async addFromRecipe(recipe) {
         const result = await this.run(recipe)
         if (!result) return
-        const layer = this.newLayer({ name: recipe.name, recipe }, result)
+        const pose = recipe.pose === undefined ? undefined : readPoses(result, this.W, this.H)
+        const layer = this.newLayer({ name: recipe.name, recipe, pose }, result)
         const index = this.stack.length
         this.insertLayer(layer, index)
         this.push({ undo: () => this.removeLayer(layer.id), redo: () => this.insertLayer(layer, index) })
@@ -534,6 +656,7 @@ class Editor {
     async regenerate(id) {
         const result = await this.run(this.layers[id].recipe)
         if (!result || !this.layers[id]) return
+        if (this.layers[id].pose) return this.setPose(this.layers[id], readPoses(result, this.W, this.H))
         const done = this.recordLayer(id, 0, 0, this.W, this.H)
         this.layers[id].ctx.clearRect(0, 0, this.W, this.H)
         this.layers[id].ctx.drawImage(result, 0, 0, this.W, this.H)
@@ -606,6 +729,7 @@ class Editor {
             scrub(opacity, { min: 0, max: 100, span: 200 }, setOpacity)
             const [again, remove] = el.querySelectorAll("button")
             again.disabled = !!this.busy
+            again.hidden = !layer.recipe
             again.addEventListener("click", () => this.regenerate(id))
             remove.addEventListener("click", () => this.deleteLayer(id))
         }
@@ -660,11 +784,16 @@ class Editor {
         else if (this.space || this.tool === "hand") this.canvas.style.cursor = "grab"
         else if (this.tool === "brush" || this.tool === "eraser") this.canvas.style.cursor = "none"
         else if (this.tool === "crop" && this.mouse) this.canvas.style.cursor = CURSORS[this.hit(...this.mouse)]
+        else if (this.tool === "pose") {
+            this.poseHover = this.mouse && !this.drag ? this.hitPose(...this.mouse) : null
+            this.canvas.style.cursor = this.drag ? "grabbing" : !this.poseHover ? "default" : this.poseHover.joint === null ? "move" : "grab"
+        }
         else this.canvas.style.cursor = "default"
     }
 
     close() {
         activeEditor = null
+        app.constructor.maskeditor_is_opended = this.maskEditorOpened
         this.resize.disconnect()
         clearTimeout(this.hudTimer)
         this.root.remove()
@@ -681,8 +810,8 @@ class Editor {
             if (this.stack.length) {
                 edit.layers = []
                 for (const id of this.stack) {
-                    const { canvas, name, recipe, visible, opacity } = this.layers[id]
-                    edit.layers.push({ file: await uploadLayer(canvas), name, recipe, visible, opacity })
+                    const { canvas, name, recipe, visible, opacity, pose } = this.layers[id]
+                    edit.layers.push({ file: await uploadLayer(canvas), name, recipe, visible, opacity, ...(pose && { pose }) })
                 }
             }
         } catch (error) {
@@ -887,14 +1016,28 @@ class Editor {
         this.canvas.focus()
         const [sx, sy] = this.pos(e)
         let mode = null
+        let hit = null
         if (e.button === 1 || (e.button === 0 && (this.space || this.tool === "hand"))) mode = "pan"
         else if (e.button === 0 && this.tool === "crop") mode = this.hit(sx, sy)
-        else if (e.button === 0 && (this.tool === "brush" || this.tool === "eraser")) mode = "stroke"
+        else if (e.button === 0 && (this.tool === "brush" || this.tool === "eraser")) {
+            if (this.layers[this.target].pose) return this.showHud("Pose layers change with the Pose tool (P)")
+            mode = "stroke"
+        } else if (e.button === 0 && this.tool === "pose") {
+            hit = this.hitPose(sx, sy)
+            this.posePerson = hit?.person ?? null
+            this.redrawOverlay()
+            if (hit) mode = "pose"
+        }
         if (!mode) return
         e.preventDefault()
         this.canvas.setPointerCapture(e.pointerId)
         this.drag = { mode, sx, sy, crop: this.cropState(), ox: this.ox, oy: this.oy, angle: this.angleAt(sx, sy) }
         if (mode === "stroke") this.startStroke(this.toPicture(sx, sy))
+        if (mode === "pose") {
+            const layer = this.poseLayer()
+            this.drag.pose = { layer, before: layer.pose, joint: hit.joint, last: this.toPicture(sx, sy), moved: false }
+            layer.pose = structuredClone(layer.pose)
+        }
         this.updateCursor()
     }
 
@@ -911,6 +1054,16 @@ class Editor {
         const dy = (sy - d.sy) / this.scale
         if (d.mode === "stroke") {
             for (const ev of e.getCoalescedEvents?.() ?? [e]) this.strokeTo(this.toPicture(...this.pos(ev)))
+            this.redraw()
+            return
+        }
+        if (d.mode === "pose") {
+            const p = this.toPicture(sx, sy)
+            const { layer, joint, last } = d.pose
+            this.movePose(layer.pose[this.posePerson], joint, p[0] - last[0], p[1] - last[1])
+            d.pose.last = p
+            d.pose.moved = true
+            drawPoses(layer.ctx, layer.pose, this.W, this.H)
             this.redraw()
             return
         }
@@ -960,8 +1113,84 @@ class Editor {
         if (!d) return
         this.drag = null
         if (d.mode === "stroke") this.endStroke()
-        else if (d.mode !== "pan") this.pushCrop(d.crop)
+        else if (d.mode === "pose") {
+            if (d.pose.moved) this.pushPose(d.pose.layer, d.pose.before)
+        } else if (d.mode !== "pan") this.pushCrop(d.crop)
         this.onMove(e)
+    }
+
+    // The pose layer the Pose tool edits: the selected layer, or else the top pose layer.
+    poseLayer() {
+        if (this.layers[this.target]?.pose) return this.layers[this.target]
+        const id = [...this.stack].reverse().find((id) => this.layers[id].pose)
+        return id ? this.layers[id] : null
+    }
+
+    // Picture pixels to screen.
+    fromPicture(x, y) {
+        const r = (this.rotate * Math.PI) / 180
+        const c = Math.cos(r)
+        const s = Math.sin(r)
+        const u = x - this.W / 2
+        const v = y - this.H / 2
+        return this.toScreen(c * u - s * v, s * u + c * v)
+    }
+
+    // The body point under the pointer, or else the limb, as {person, joint}; joint is null on a limb.
+    hitPose(sx, sy) {
+        const people = this.poseLayer()?.pose ?? []
+        for (let i = people.length - 1; i >= 0; i--) {
+            const j = people[i].body.findIndex((p) => p && Math.hypot(sx - this.fromPicture(...p)[0], sy - this.fromPicture(...p)[1]) <= 8)
+            if (j >= 0) return { person: i, joint: j }
+        }
+        for (let i = people.length - 1; i >= 0; i--) {
+            const body = people[i].body
+            for (const [a, b] of POSE_LIMBS) {
+                if (!body[a] || !body[b]) continue
+                const [x1, y1] = this.fromPicture(...body[a])
+                const [x2, y2] = this.fromPicture(...body[b])
+                const t = Math.min(Math.max(((sx - x1) * (x2 - x1) + (sy - y1) * (y2 - y1)) / ((x2 - x1) ** 2 + (y2 - y1) ** 2 || 1), 0), 1)
+                if (Math.hypot(sx - x1 - t * (x2 - x1), sy - y1 - t * (y2 - y1)) <= 6) return { person: i, joint: null }
+            }
+        }
+        return null
+    }
+
+    // Moves a body point with the part attached to it, or the whole person when joint is null.
+    movePose(person, joint, dx, dy) {
+        const shift = (points) => {
+            for (const p of points ?? []) {
+                if (!p) continue
+                p[0] += dx
+                p[1] += dy
+            }
+        }
+        if (joint === null) {
+            for (const part of ["body", "leftHand", "rightHand", "face"]) shift(person[part])
+            return
+        }
+        shift([person.body[joint]])
+        shift(person[POSE_ATTACHED[joint]])
+    }
+
+    // Without a pose layer, makes one: a pose can be posed from scratch.
+    addPerson() {
+        let layer = this.poseLayer()
+        if (!layer) {
+            layer = this.newLayer({ name: "Pose", recipe: null, pose: [] })
+            const index = this.stack.length
+            this.insertLayer(layer, index)
+            this.push({ undo: () => this.removeLayer(layer.id), redo: () => this.insertLayer(layer, index) })
+        }
+        this.setPose(layer, [...layer.pose, defaultPerson(this.W, this.H)])
+        this.posePerson = layer.pose.length - 1
+    }
+
+    deletePerson() {
+        const layer = this.poseLayer()
+        if (!layer?.pose[this.posePerson]) return
+        this.setPose(layer, layer.pose.filter((_, i) => i !== this.posePerson))
+        this.posePerson = null
     }
 
     // A stroke is drawn as a coverage map: opaque gray dabs on black, merged with "lighten" so
@@ -1116,8 +1345,9 @@ class Editor {
             this.invertMask()
             this.showHud("Mask inverted")
         } else if (!e.ctrlKey && !e.altKey && !e.metaKey) {
-            const tool = { c: "crop", b: "brush", e: "eraser", h: "hand" }[key]
+            const tool = { c: "crop", b: "brush", e: "eraser", p: "pose", h: "hand" }[key]
             if (tool) this.setTool(tool)
+            else if (this.tool === "pose" && (e.key === "Delete" || e.key === "Backspace")) this.deletePerson()
             else if (key === "m") this.setTarget(this.target === "mask" ? "paint" : "mask")
             else if (key === "q" && e.shiftKey) {
                 this.setShowMask(!this.showMask)
@@ -1242,6 +1472,25 @@ class Editor {
             for (const [x, y] of [[l, t], [(l + r) / 2, t], [r, t], [r, (t + b) / 2], [r, b], [(l + r) / 2, b], [l, b], [l, (t + b) / 2]]) {
                 ctx.fillRect(x - 4, y - 4, 8, 8)
             }
+        }
+
+        // Pose handles: one dot per body point, outlined in white for the selected person.
+        if (this.tool === "pose") {
+            for (const [i, person] of (this.poseLayer()?.pose ?? []).entries()) {
+                person.body.forEach((p, j) => {
+                    if (!p) return
+                    const [x, y] = this.fromPicture(...p)
+                    const hovered = this.poseHover?.person === i && this.poseHover.joint === j
+                    ctx.fillStyle = rgb(POSE_COLORS[j])
+                    ctx.strokeStyle = i === this.posePerson ? "#ffffff" : "rgba(0, 0, 0, 0.8)"
+                    ctx.lineWidth = i === this.posePerson ? 2 : 1
+                    ctx.beginPath()
+                    ctx.arc(x, y, hovered ? 7 : 5, 0, Math.PI * 2)
+                    ctx.fill()
+                    ctx.stroke()
+                })
+            }
+            ctx.lineWidth = 1
         }
 
         // The brush outline shows its size, and the inner circle where the soft edge starts.
