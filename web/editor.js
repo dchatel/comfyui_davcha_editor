@@ -9,6 +9,58 @@ const CURSORS = {
 }
 const MASK_VIEWS = ["Color", "White", "Black", "Negative"]
 const SETTINGS = { view: "DavchaEditor.Mask.View", color: "DavchaEditor.Mask.Color", opacity: "DavchaEditor.Mask.Opacity" }
+
+// Number fields that also change by dragging on their label, like Photoshop's scrubby sliders,
+// with a gauge behind the value. `span` is the drag in pixels across the whole range, ten times
+// longer with Shift.
+const FIELDS = {
+    rotate: { min: -180, max: 180, span: 720, decimals: 2 },
+    size: { min: 1, max: 2000, span: 300, log: true },
+    opacity: { min: 1, max: 100, span: 200 },
+    hardness: { min: 0, max: 100, span: 200 },
+    maskOpacity: { min: 0, max: 100, span: 200 },
+}
+
+function fieldPosition(f, value) {
+    const t = f.log ? Math.log(value / f.min) / Math.log(f.max / f.min) : (value - f.min) / (f.max - f.min)
+    return Math.min(Math.max(t, 0), 1)
+}
+
+function fieldValue(f, t) {
+    const value = f.log ? f.min * Math.pow(f.max / f.min, t) : f.min + t * (f.max - f.min)
+    return Number(value.toFixed(f.decimals ?? 0))
+}
+
+// Calls apply(value, done) while the label is dragged, with done set on release.
+function scrub(input, f, apply) {
+    const label = input.closest("label")
+    label.classList.add("de-scrub")
+    // Clicking a label would focus its field, and the editor shortcuts would type into it.
+    label.addEventListener("click", (e) => {
+        if (e.target !== input) e.preventDefault()
+    })
+    label.addEventListener("pointerdown", (e) => {
+        if (e.target === input || e.button !== 0 || input.disabled) return
+        e.preventDefault()
+        label.setPointerCapture(e.pointerId)
+        let x = e.clientX
+        let t = fieldPosition(f, Number(input.value))
+        let value = Number(input.value)
+        const move = (ev) => {
+            t = Math.min(Math.max(t + (ev.clientX - x) / (f.span * (ev.shiftKey ? 10 : 1)), 0), 1)
+            x = ev.clientX
+            value = fieldValue(f, t)
+            apply(value, false)
+        }
+        const up = () => {
+            label.removeEventListener("pointermove", move)
+            label.removeEventListener("pointerup", up)
+            apply(value, true)
+        }
+        label.addEventListener("pointermove", move)
+        label.addEventListener("pointerup", up)
+    })
+}
 const LAYERS = ["paint", "mask"]
 
 const HELP = {
@@ -24,7 +76,8 @@ const STYLE = `
 .davcha-editor .de-grow { flex: 1; }
 .davcha-editor .de-sep { width: 1px; align-self: stretch; background: #3a3a3a; }
 .davcha-editor .de-options { display: flex; align-items: center; gap: 8px; }
-.davcha-editor input[type=number] { width: 56px; background: #111; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; }
+.davcha-editor input[type=number] { width: 56px; background: linear-gradient(to right, #2c4466 var(--fill, 0%), #111 var(--fill, 0%)); color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; }
+.davcha-editor label.de-scrub { cursor: ew-resize; user-select: none; }
 .davcha-editor select { background: #111; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; }
 .davcha-editor input[type=color] { width: 32px; height: 22px; padding: 0; border: 1px solid #444; background: none; }
 .davcha-editor button { background: #333; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 3px 10px; cursor: pointer; }
@@ -250,6 +303,28 @@ class Editor {
             this.maskOpacity = Math.min(Math.max(Number(this.inputs.maskOpacity.value) || 0, 0), 100) / 100
             this.inputs.maskOpacity.value = Math.round(this.maskOpacity * 100)
             app.extensionManager.setting.set(SETTINGS.opacity, Math.round(this.maskOpacity * 100))
+            this.redraw()
+        })
+        // A dragged rotation is one undo step.
+        let rotateBefore = null
+        scrub(this.inputs.rotate, FIELDS.rotate, (value, done) => {
+            rotateBefore ??= this.cropState()
+            this.setRotate(value)
+            if (!done) return
+            this.pushCrop(rotateBefore)
+            rotateBefore = null
+        })
+        for (const name of ["size", "opacity", "hardness"]) {
+            scrub(this.inputs[name], FIELDS[name], (value) => {
+                this.inputs[name].value = value
+                this.inputs[name].dispatchEvent(new Event("change"))
+            })
+        }
+        // The setting is saved once, on release.
+        scrub(this.inputs.maskOpacity, FIELDS.maskOpacity, (value, done) => {
+            this.inputs.maskOpacity.value = value
+            this.maskOpacity = value / 100
+            if (done) app.extensionManager.setting.set(SETTINGS.opacity, value)
             this.redraw()
         })
         this.canvas.addEventListener("pointerdown", (e) => this.onDown(e))
@@ -829,6 +904,9 @@ class Editor {
         const crop = this.tool === "crop"
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
         ctx.clearRect(0, 0, cw, ch)
+        for (const [name, field] of Object.entries(FIELDS)) {
+            this.inputs[name].style.setProperty("--fill", `${fieldPosition(field, Number(this.inputs[name].value)) * 100}%`)
+        }
 
         // Outside the frame is what the node won't output: dimmed while cropping, almost hidden otherwise.
         const [l, t] = this.toScreen(f.l, f.t)
