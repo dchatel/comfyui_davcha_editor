@@ -42,17 +42,25 @@ def load_image(path):
 
 def edit_image(img, edit):
     """Returns the RGB picture and its alpha, None for a picture without alpha and no edit.
-    The edit's paint layer is drawn over the picture and its mask layer is cut out of the
-    alpha, before the rotation and the frame. Both layers are input files of the picture's size."""
+    Before the rotation and the frame, the visible edit["layers"] (such as preprocessor results)
+    and then the paint layer are drawn over the picture, or over black when edit["image_visible"]
+    is false, and the mask layer is cut out of the alpha. Layers are input files of the picture's size."""
     rgb = img.convert("RGB")
     alpha = img.getchannel("A") if "A" in img.getbands() else None
     if not edit:
         return rgb, alpha
     if alpha is None:
         alpha = Image.new("L", img.size, 255)
+    layers = [(layer["file"], layer["opacity"]) for layer in edit.get("layers", []) if layer["visible"]]
     if "paint" in edit:
-        rgb = rgb.convert("RGBA")
-        rgb.alpha_composite(load_image(folder_paths.get_annotated_filepath(edit["paint"])).convert("RGBA"))
+        layers.append((edit["paint"], 1.0))
+    if layers or not edit.get("image_visible", True):
+        rgb = rgb.convert("RGBA") if edit.get("image_visible", True) else Image.new("RGBA", img.size, (0, 0, 0, 255))
+        for file, opacity in layers:
+            layer = load_image(folder_paths.get_annotated_filepath(file)).convert("RGBA")
+            if opacity < 1:
+                layer.putalpha(layer.getchannel("A").point(lambda a: round(a * opacity)))
+            rgb.alpha_composite(layer)
         rgb = rgb.convert("RGB")
     if "mask" in edit:
         mask = load_image(folder_paths.get_annotated_filepath(edit["mask"])).getchannel("A")
@@ -103,10 +111,11 @@ def hash_entry(m, image, edit):
 def check_entry(image, edit):
     if not folder_paths.exists_annotated_filepath(image):
         return "Invalid image file: {}".format(image)
-    layers = json.loads(edit) if edit else {}
-    for layer in ("paint", "mask"):
-        if layer in layers and not folder_paths.exists_annotated_filepath(layers[layer]):
-            return "Missing {} layer: {}".format(layer, layers[layer])
+    edit = json.loads(edit) if edit else {}
+    files = [edit[layer] for layer in ("paint", "mask") if layer in edit] + [layer["file"] for layer in edit.get("layers", [])]
+    for file in files:
+        if not folder_paths.exists_annotated_filepath(file):
+            return "Missing layer file: {}".format(file)
     return None
 
 

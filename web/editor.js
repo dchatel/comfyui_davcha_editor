@@ -88,6 +88,16 @@ const STYLE = `
 .davcha-editor .de-stage { position: relative; flex: 1; min-height: 0; }
 .davcha-editor .de-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; outline: none; }
 .davcha-editor .de-help { padding: 4px 10px; color: #888; font-size: 12px; background: #1b1b1b; border-top: 1px solid #333; }
+.davcha-editor .de-layers { position: absolute; top: 8px; right: 8px; width: 250px; display: flex; flex-direction: column; gap: 4px; padding: 6px; background: rgba(34, 34, 34, 0.92); border: 1px solid #3a3a3a; border-radius: 6px; }
+.davcha-editor .dl-title { font-weight: bold; color: #aaa; }
+.davcha-editor .dl-status { color: #8ab4f8; font-size: 12px; }
+.davcha-editor .dl-status:empty { display: none; }
+.davcha-editor .dl-row { display: flex; align-items: center; gap: 4px; padding: 2px 4px; border-radius: 4px; }
+.davcha-editor .dl-row.dl-active { background: #2c4466; }
+.davcha-editor .dl-name { flex: 1; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+.davcha-editor .dl-eye-space { width: 13px; }
+.davcha-editor .dl-row input[type=number] { width: 50px; }
+.davcha-editor .dl-row button { padding: 0 6px; }
 .davcha-gallery { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 6px; padding: 4px; overflow-y: auto; box-sizing: border-box; }
 .davcha-gallery .dg-tile { position: relative; width: 84px; height: 84px; box-sizing: border-box; border: 1px solid #444; border-radius: 4px; overflow: hidden; background: #1b1b1b; cursor: pointer; }
 .davcha-gallery .dg-tile img { width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
@@ -98,6 +108,13 @@ const STYLE = `
 .davcha-gallery .dg-add { display: flex; align-items: center; justify-content: center; border-style: dashed; color: #888; font-size: 28px; }
 `
 document.head.append(Object.assign(document.createElement("style"), { textContent: STYLE }))
+// The open editor takes every key before the rest of the page: ComfyUI's own window listeners
+// would also act on the graph, Ctrl+Z undoing it for one. Registering when the module loads puts
+// this ahead of them.
+let activeEditor = null
+window.addEventListener("keydown", (e) => activeEditor?.onKey(e, true), true)
+window.addEventListener("keyup", (e) => activeEditor?.onKey(e, false), true)
+
 // Strokes use it to turn their gray coverage map into alpha. sRGB keeps the gray values as they are.
 document.body.insertAdjacentHTML("beforeend", '<svg width="0" height="0" style="position: absolute"><filter id="davcha-luminance-to-alpha" color-interpolation-filters="sRGB"><feColorMatrix type="luminanceToAlpha"/></filter></svg>')
 
@@ -145,6 +162,71 @@ async function fetchPreview(image, edit) {
     return res.json()
 }
 
+// A recipe runs one node on the picture: {name, node, inputs}, with the picture as its "image"
+// input. user/default/davcha_editor/recipes.json can add recipes or replace these by name.
+// Recipes whose node isn't installed are left out.
+const DEFAULT_RECIPES = [
+    { name: "Edges (Canny)", node: "Canny", inputs: { low_threshold: 0.4, high_threshold: 0.8 } },
+    { name: "Depth (Depth Anything V2)", node: "AIO_Preprocessor", inputs: { preprocessor: "DepthAnythingV2Preprocessor", resolution: 1024 } },
+    { name: "Lineart (realistic)", node: "AIO_Preprocessor", inputs: { preprocessor: "LineArtPreprocessor", resolution: 1024 } },
+    { name: "Lineart (anime)", node: "AIO_Preprocessor", inputs: { preprocessor: "AnimeLineArtPreprocessor", resolution: 1024 } },
+    { name: "Lineart (standard)", node: "AIO_Preprocessor", inputs: { preprocessor: "LineartStandardPreprocessor", resolution: 1024 } },
+    { name: "Soft edges (HED)", node: "AIO_Preprocessor", inputs: { preprocessor: "HEDPreprocessor", resolution: 1024 } },
+    { name: "Scribble", node: "AIO_Preprocessor", inputs: { preprocessor: "ScribblePreprocessor", resolution: 1024 } },
+    { name: "Pose (DWPose)", node: "AIO_Preprocessor", inputs: { preprocessor: "DWPreprocessor", resolution: 1024 } },
+    { name: "Normal map (BAE)", node: "AIO_Preprocessor", inputs: { preprocessor: "BAE-NormalMapPreprocessor", resolution: 1024 } },
+]
+
+async function loadRecipes() {
+    const recipes = new Map(DEFAULT_RECIPES.map((r) => [r.name, r]))
+    const res = await api.fetchApi(`/userdata/${encodeURIComponent("davcha_editor/recipes.json")}`)
+    if (res.ok) for (const r of await res.json()) recipes.set(r.name, r)
+    return [...recipes.values()].filter((r) => LiteGraph.registered_node_types[r.node])
+}
+
+// Queues a three-node prompt (load the picture, run the recipe, preview the result) like the Run
+// button does, so the run shares ComfyUI's queue, cache and memory management. The prompt's node
+// ids match nothing on the graph, and the run is removed from the history once its result is read.
+async function runRecipe(image, recipe) {
+    const finished = new Map()
+    let promptId = null
+    let settle = null
+    const onEvent = ({ type, detail }) => {
+        finished.set(detail?.prompt_id, type === "execution_success" ? null : detail?.exception_message ?? "The run was interrupted")
+        if (detail?.prompt_id === promptId) settle?.()
+    }
+    const events = ["execution_success", "execution_error", "execution_interrupted"]
+    for (const type of events) api.addEventListener(type, onEvent)
+    try {
+        const prompt = {
+            dpp_load: { class_type: "LoadImage", inputs: { image } },
+            dpp_run: { class_type: recipe.node, inputs: { ...recipe.inputs, image: ["dpp_load", 0] } },
+            dpp_out: { class_type: "PreviewImage", inputs: { images: ["dpp_run", 0] } },
+        }
+        const res = await api.fetchApi("/prompt", { method: "POST", body: JSON.stringify({ prompt, client_id: api.clientId, front: true }) })
+        const queued = await res.json()
+        if (!res.ok) {
+            const details = Object.values(queued.node_errors ?? {}).flatMap((n) => n.errors.map((e) => e.details || e.message))
+            throw new Error([queued.error?.message ?? `Queue failed: ${res.status}`, ...details].join(": "))
+        }
+        promptId = queued.prompt_id
+        if (!finished.has(promptId)) await new Promise((resolve) => (settle = resolve))
+        if (finished.get(promptId)) throw new Error(finished.get(promptId))
+        const history = await (await api.fetchApi(`/history/${promptId}`)).json()
+        const { filename, subfolder, type } = history[promptId].outputs.dpp_out.images[0]
+        await api.fetchApi("/history", { method: "POST", body: JSON.stringify({ delete: [promptId] }) })
+        return loadImage(`${subfolder ? `${subfolder}/` : ""}${filename} [${type}]`)
+    } finally {
+        for (const type of events) api.removeEventListener(type, onEvent)
+    }
+}
+
+function showError(error) {
+    const toast = app.extensionManager.toast
+    if (toast.error) toast.error("Editor", { description: error.message, duration: 5000 })
+    else toast.add({ severity: "error", summary: "Editor", detail: error.message, life: 5000 })
+}
+
 async function updatePreview(node) {
     const edit = node.widgets.find((w) => w.name === "edit").value
     const image = node.widgets.find((w) => w.name === "image").value
@@ -160,7 +242,8 @@ async function updatePreview(node) {
 // mask layers have the picture's size and are drawn in its own (unrotated) pixels. The node's
 // Python applies the same edit to the original file.
 class Editor {
-    constructor(img, edit, layers, onApply) {
+    constructor(image, img, edit, layers, onApply) {
+        this.image = image
         this.onApply = onApply
         this.img = img
         this.W = img.naturalWidth
@@ -179,6 +262,12 @@ class Editor {
             if (layers[name]) canvas.getContext("2d").drawImage(layers[name], 0, 0)
             this.layers[name] = { canvas, ctx: canvas.getContext("2d"), used: !!layers[name] }
         }
+        // Recipe layers, bottom to top, between the picture and the paint layer.
+        this.stack = []
+        this.nextLayer = 1
+        this.imageVisible = edit?.image_visible ?? true
+        for (const [i, info] of (edit?.layers ?? []).entries()) this.insertLayer(this.newLayer(info, layers.recipes[i]), this.stack.length)
+        this.busy = null
         this.strokeCanvas = this.newCanvas()
         this.strokeCtx = this.strokeCanvas.getContext("2d")
         this.strokeAlphaCanvas = this.newCanvas()
@@ -244,7 +333,9 @@ class Editor {
   <button data-action="undo" title="Undo (Ctrl+Z)">↶</button><button data-action="redo" title="Redo (Ctrl+Y)">↷</button>
   <button data-action="reset">Reset</button><button data-action="cancel">Cancel</button><button data-action="apply" class="de-primary">Apply</button>
 </div>
-<div class="de-stage"><canvas class="de-main"></canvas><canvas class="de-overlay" tabindex="0"></canvas></div>
+<div class="de-stage"><canvas class="de-main"></canvas><canvas class="de-overlay" tabindex="0"></canvas>
+  <div class="de-layers"><div class="dl-title">Layers</div><select class="dl-add"><option value="">Add from recipe…</option></select><div class="dl-status"></div><div class="dl-list"></div></div>
+</div>
 <div class="de-help"></div>`
         this.main = this.root.querySelector(".de-main")
         this.mainCtx = this.main.getContext("2d")
@@ -271,6 +362,18 @@ class Editor {
         this.inputs.maskOpacity.value = Math.round(this.maskOpacity * 100)
         this.syncBrushInputs()
         this.setMaskView(this.maskView)
+        const add = this.root.querySelector(".dl-add")
+        loadRecipes()
+            .then((recipes) => {
+                this.recipes = recipes
+                for (const recipe of recipes) add.append(new Option(recipe.name))
+            })
+            .catch(showError)
+        add.addEventListener("change", () => {
+            const recipe = this.recipes.find((r) => r.name === add.value)
+            add.value = ""
+            this.addFromRecipe(recipe)
+        })
 
         this.root.querySelector(".de-bar").addEventListener("click", (e) => {
             const { action, tool, target } = e.target.dataset ?? {}
@@ -341,10 +444,7 @@ class Editor {
         })
         this.canvas.addEventListener("wheel", (e) => this.onWheel(e), { passive: false })
         this.canvas.addEventListener("contextmenu", (e) => e.preventDefault())
-        this.onKeyDown = (e) => this.onKey(e, true)
-        this.onKeyUp = (e) => this.onKey(e, false)
-        window.addEventListener("keydown", this.onKeyDown, true)
-        window.addEventListener("keyup", this.onKeyUp, true)
+        activeEditor = this
 
         document.body.append(this.root)
         this.resize = new ResizeObserver(() => {
@@ -373,7 +473,123 @@ class Editor {
     setTarget(target) {
         this.target = target
         for (const b of this.root.querySelectorAll("[data-target]")) b.classList.toggle("de-active", b.dataset.target === target)
-        this.inputs.color.style.display = target === "paint" ? "" : "none"
+        this.inputs.color.style.display = target === "mask" ? "none" : ""
+        this.renderLayers()
+    }
+
+    // A recipe layer: its result stretched over the picture, which is where the recipe ran.
+    newLayer({ name, recipe, visible = true, opacity = 1 }, result) {
+        const canvas = this.newCanvas()
+        const ctx = canvas.getContext("2d")
+        ctx.drawImage(result, 0, 0, this.W, this.H)
+        return { id: `layer${this.nextLayer++}`, canvas, ctx, used: true, name, recipe, visible, opacity }
+    }
+
+    insertLayer(layer, index) {
+        this.layers[layer.id] = layer
+        this.stack.splice(index, 0, layer.id)
+    }
+
+    removeLayer(id) {
+        const index = this.stack.indexOf(id)
+        this.stack.splice(index, 1)
+        delete this.layers[id]
+        if (this.target === id) this.setTarget("paint")
+        return index
+    }
+
+    async addFromRecipe(recipe) {
+        const result = await this.run(recipe)
+        if (!result) return
+        const layer = this.newLayer({ name: recipe.name, recipe }, result)
+        const index = this.stack.length
+        this.insertLayer(layer, index)
+        this.push({ undo: () => this.removeLayer(layer.id), redo: () => this.insertLayer(layer, index) })
+        this.renderLayers()
+        this.redraw()
+    }
+
+    async regenerate(id) {
+        const result = await this.run(this.layers[id].recipe)
+        if (!result || !this.layers[id]) return
+        const done = this.recordLayer(id, 0, 0, this.W, this.H)
+        this.layers[id].ctx.clearRect(0, 0, this.W, this.H)
+        this.layers[id].ctx.drawImage(result, 0, 0, this.W, this.H)
+        done(true)
+        this.redraw()
+    }
+
+    deleteLayer(id) {
+        const layer = this.layers[id]
+        const index = this.removeLayer(id)
+        this.push({ undo: () => this.insertLayer(layer, index), redo: () => this.removeLayer(id) })
+        this.renderLayers()
+        this.redraw()
+    }
+
+    // Runs a recipe on the picture, one at a time. Returns nothing once the editor is closed.
+    async run(recipe) {
+        this.busy = recipe.name
+        this.renderLayers()
+        try {
+            const result = await runRecipe(this.image, recipe)
+            return this.root.isConnected ? result : null
+        } catch (error) {
+            showError(error)
+            return null
+        } finally {
+            this.busy = null
+            if (this.root.isConnected) this.renderLayers()
+        }
+    }
+
+    // Top to bottom: paint, recipe layers, picture. Clicking a name picks the layer to paint on;
+    // the mask has its own button in the bar.
+    renderLayers() {
+        const list = this.root.querySelector(".dl-list")
+        list.replaceChildren()
+        const row = (id, name) => {
+            const el = document.createElement("div")
+            el.className = "dl-row" + (id === this.target ? " dl-active" : "")
+            el.innerHTML = `<span class="dl-name"></span>`
+            el.querySelector(".dl-name").textContent = name
+            if (id) el.querySelector(".dl-name").addEventListener("click", () => this.setTarget(id))
+            list.append(el)
+            return el
+        }
+        const eye = (el, visible, onChange) => {
+            const box = Object.assign(document.createElement("input"), { type: "checkbox", checked: visible, title: "Visible, and in the output" })
+            box.addEventListener("change", () => {
+                onChange(box.checked)
+                this.redraw()
+            })
+            el.prepend(box)
+        }
+        row("paint", "Paint").prepend(Object.assign(document.createElement("span"), { className: "dl-eye-space" }))
+        for (const id of [...this.stack].reverse()) {
+            const layer = this.layers[id]
+            const el = row(id, layer.name)
+            eye(el, layer.visible, (v) => (layer.visible = v))
+            el.insertAdjacentHTML("beforeend", `<label title="Opacity">◐ <input type="number" min="0" max="100"></label><button title="Run again">↻</button><button title="Delete">×</button>`)
+            const opacity = el.querySelector("input[type=number]")
+            opacity.value = Math.round(layer.opacity * 100)
+            opacity.style.setProperty("--fill", `${opacity.value}%`)
+            const setOpacity = (value) => {
+                layer.opacity = Math.min(Math.max(value, 0), 100) / 100
+                opacity.value = Math.round(layer.opacity * 100)
+                opacity.style.setProperty("--fill", `${opacity.value}%`)
+                this.redraw()
+            }
+            opacity.addEventListener("change", () => setOpacity(Number(opacity.value) || 0))
+            scrub(opacity, { min: 0, max: 100, span: 200 }, setOpacity)
+            const [again, remove] = el.querySelectorAll("button")
+            again.disabled = !!this.busy
+            again.addEventListener("click", () => this.regenerate(id))
+            remove.addEventListener("click", () => this.deleteLayer(id))
+        }
+        eye(row(null, "Image"), this.imageVisible, (v) => (this.imageVisible = v))
+        this.root.querySelector(".dl-add").disabled = !!this.busy
+        this.root.querySelector(".dl-status").textContent = this.busy ? `Running ${this.busy}…` : ""
     }
 
     setMaskView(view) {
@@ -426,8 +642,7 @@ class Editor {
     }
 
     close() {
-        window.removeEventListener("keydown", this.onKeyDown, true)
-        window.removeEventListener("keyup", this.onKeyUp, true)
+        activeEditor = null
         this.resize.disconnect()
         clearTimeout(this.hudTimer)
         this.root.remove()
@@ -441,15 +656,21 @@ class Editor {
             for (const name of LAYERS) {
                 if (this.layers[name].used) edit[name] = await uploadLayer(this.layers[name].canvas)
             }
+            if (this.stack.length) {
+                edit.layers = []
+                for (const id of this.stack) {
+                    const { canvas, name, recipe, visible, opacity } = this.layers[id]
+                    edit.layers.push({ file: await uploadLayer(canvas), name, recipe, visible, opacity })
+                }
+            }
         } catch (error) {
             for (const b of this.root.querySelectorAll("button")) b.disabled = false
-            const toast = app.extensionManager.toast
-            if (toast.error) toast.error("Editor", { description: error.message, duration: 5000 })
-            else toast.add({ severity: "error", summary: "Editor", detail: error.message, life: 5000 })
+            showError(error)
             return
         }
+        if (!this.imageVisible) edit.image_visible = false
         const full = this.fullFrame()
-        const identity = this.rotate === 0 && f.l === full.l && f.t === full.t && f.r === full.r && f.b === full.b && !edit.paint && !edit.mask
+        const identity = this.rotate === 0 && f.l === full.l && f.t === full.t && f.r === full.r && f.b === full.b && !edit.paint && !edit.mask && !edit.layers && this.imageVisible
         this.onApply(identity ? "" : JSON.stringify(edit))
         this.close()
     }
@@ -479,6 +700,7 @@ class Editor {
         if (!entry) return
         entry.undo()
         this.redoStack.push(entry)
+        this.renderLayers()
         this.redraw()
     }
 
@@ -487,6 +709,7 @@ class Editor {
         if (!entry) return
         entry.redo()
         this.undoStack.push(entry)
+        this.renderLayers()
         this.redraw()
     }
 
@@ -717,7 +940,7 @@ class Editor {
         this.stroke = {
             layer: this.target,
             erase,
-            color: this.target === "paint" && !erase ? this.brush.color : "#ffffff",
+            color: this.target !== "mask" && !erase ? this.brush.color : "#ffffff",
             opacity: this.brush.opacity,
             radius: this.brush.size / 2,
             hardness: this.brush.hardness,
@@ -829,7 +1052,7 @@ class Editor {
     // Keys go nowhere else while the editor is open, so ComfyUI shortcuts don't act on the graph.
     // Letters are read as typed, so shortcuts follow the keyboard layout.
     onKey(e, down) {
-        e.stopPropagation()
+        e.stopImmediatePropagation()
         if (e.target instanceof HTMLInputElement) {
             if (down && e.key === "Enter") e.target.blur()
             return
@@ -901,10 +1124,15 @@ class Editor {
         ctx.imageSmoothingEnabled = this.scale < 1
         ctx.rotate((this.rotate * Math.PI) / 180)
         ctx.translate(-this.W / 2, -this.H / 2)
-        ctx.drawImage(this.img, 0, 0)
-        for (const name of LAYERS) {
-            if (name === "mask" && !this.showMask) continue
-            let canvas = this.layers[name].canvas
+        if (this.imageVisible) ctx.drawImage(this.img, 0, 0)
+        else {
+            ctx.fillStyle = "#000000"
+            ctx.fillRect(0, 0, this.W, this.H)
+        }
+        for (const name of [...this.stack, "paint", "mask"]) {
+            const layer = this.layers[name]
+            if (name === "mask" ? !this.showMask : layer.visible === false) continue
+            let canvas = layer.canvas
             if (this.stroke?.layer === name) {
                 this.previewCtx.clearRect(0, 0, this.W, this.H)
                 this.previewCtx.drawImage(canvas, 0, 0)
@@ -912,7 +1140,11 @@ class Editor {
                 canvas = this.previewCanvas
             }
             if (name === "mask") this.drawMask(ctx, canvas)
-            else ctx.drawImage(canvas, 0, 0)
+            else {
+                ctx.globalAlpha = layer.opacity ?? 1
+                ctx.drawImage(canvas, 0, 0)
+                ctx.globalAlpha = 1
+            }
         }
     }
 
@@ -1015,11 +1247,11 @@ async function editPicture(image, value, onApply) {
     opening = true
     try {
         const edit = value ? JSON.parse(value) : null
-        const layers = {}
+        const layers = { recipes: await Promise.all((edit?.layers ?? []).map((layer) => loadImage(layer.file))) }
         for (const name of LAYERS) {
             if (edit?.[name]) layers[name] = await loadImage(edit[name])
         }
-        new Editor(await loadImage(image), edit, layers, onApply)
+        new Editor(image, await loadImage(image), edit, layers, onApply)
     } finally {
         opening = false
     }
