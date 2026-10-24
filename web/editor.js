@@ -98,6 +98,8 @@ const STYLE = `
 .davcha-gallery .dg-add { display: flex; align-items: center; justify-content: center; border-style: dashed; color: #888; font-size: 28px; }
 `
 document.head.append(Object.assign(document.createElement("style"), { textContent: STYLE }))
+// Strokes use it to turn their gray coverage map into alpha. sRGB keeps the gray values as they are.
+document.body.insertAdjacentHTML("beforeend", '<svg width="0" height="0" style="position: absolute"><filter id="davcha-luminance-to-alpha" color-interpolation-filters="sRGB"><feColorMatrix type="luminanceToAlpha"/></filter></svg>')
 
 function viewUrl(value) {
     let type = "input"
@@ -179,6 +181,8 @@ class Editor {
         }
         this.strokeCanvas = this.newCanvas()
         this.strokeCtx = this.strokeCanvas.getContext("2d")
+        this.strokeAlphaCanvas = this.newCanvas()
+        this.strokeAlphaCtx = this.strokeAlphaCanvas.getContext("2d")
         this.previewCanvas = this.newCanvas()
         this.previewCtx = this.previewCanvas.getContext("2d")
         this.tintCanvas = this.newCanvas()
@@ -702,8 +706,11 @@ class Editor {
         this.onMove(e)
     }
 
-    // Strokes are drawn opaque on a scratch canvas, then merged into the layer with the brush
-    // opacity, so overlapping dabs of one stroke don't build up past it.
+    // A stroke is drawn as a coverage map: opaque gray dabs on black, merged with "lighten" so
+    // that each pixel keeps the most coverage any dab gave it. Adding overlapping dabs instead
+    // would fill in the soft edge and make a soft brush look harder. The map becomes the
+    // stroke's alpha through a luminance-to-alpha filter, then goes into the layer with the
+    // brush opacity.
     startStroke(p) {
         const erase = this.tool === "eraser"
         this.stroke = {
@@ -716,7 +723,10 @@ class Editor {
             last: p,
             box: [p[0], p[1], p[0], p[1]],
         }
-        this.strokeCtx.clearRect(0, 0, this.W, this.H)
+        this.strokeCtx.globalCompositeOperation = "source-over"
+        this.strokeCtx.fillStyle = "#000000"
+        this.strokeCtx.fillRect(0, 0, this.W, this.H)
+        this.strokeCtx.globalCompositeOperation = "lighten"
         this.dab(p)
     }
 
@@ -724,7 +734,8 @@ class Editor {
         const s = this.stroke
         const [x0, y0] = s.last
         const dist = Math.hypot(p[0] - x0, p[1] - y0)
-        const step = Math.max(1, s.radius * 0.15)
+        // Close dabs: with the most coverage kept, wider gaps would ripple along a soft stroke.
+        const step = Math.max(1, s.radius * 0.05)
         if (dist < step) return
         const n = Math.floor(dist / step)
         for (let i = 1; i <= n; i++) this.dab([x0 + ((p[0] - x0) * i * step) / dist, y0 + ((p[1] - y0) * i * step) / dist])
@@ -736,8 +747,8 @@ class Editor {
         const ctx = this.strokeCtx
         const inner = s.radius * Math.min(s.hardness, 0.99)
         const g = ctx.createRadialGradient(x, y, inner, x, y, s.radius)
-        g.addColorStop(0, s.color)
-        g.addColorStop(1, s.color + "00")
+        g.addColorStop(0, "#ffffff")
+        g.addColorStop(1, "#000000")
         ctx.fillStyle = g
         ctx.beginPath()
         ctx.arc(x, y, s.radius, 0, Math.PI * 2)
@@ -745,20 +756,39 @@ class Editor {
         s.box = [Math.min(s.box[0], x), Math.min(s.box[1], y), Math.max(s.box[2], x), Math.max(s.box[3], y)]
     }
 
+    // The stroke's area in picture pixels, as integers inside the picture.
+    strokeArea() {
+        const s = this.stroke
+        const r = s.radius + 1
+        const x = Math.max(0, Math.floor(s.box[0] - r))
+        const y = Math.max(0, Math.floor(s.box[1] - r))
+        return [x, y, Math.min(this.W, Math.ceil(s.box[2] + r)) - x, Math.min(this.H, Math.ceil(s.box[3] + r)) - y]
+    }
+
     composeStroke(ctx) {
         const s = this.stroke
+        const [x, y, w, h] = this.strokeArea()
+        if (w <= 0 || h <= 0) return
+        const alpha = this.strokeAlphaCtx
+        alpha.clearRect(x, y, w, h)
+        alpha.filter = "url(#davcha-luminance-to-alpha)"
+        alpha.drawImage(this.strokeCanvas, x, y, w, h, x, y, w, h)
+        alpha.filter = "none"
+        alpha.globalCompositeOperation = "source-in"
+        alpha.fillStyle = s.color
+        alpha.fillRect(x, y, w, h)
+        alpha.globalCompositeOperation = "source-over"
         ctx.save()
         ctx.globalAlpha = s.opacity
         ctx.globalCompositeOperation = s.erase ? "destination-out" : "source-over"
-        ctx.drawImage(this.strokeCanvas, 0, 0)
+        ctx.drawImage(this.strokeAlphaCanvas, x, y, w, h, x, y, w, h)
         ctx.restore()
     }
 
     endStroke() {
         const s = this.stroke
         const layer = this.layers[s.layer]
-        const r = s.radius + 1
-        const done = this.recordLayer(s.layer, s.box[0] - r, s.box[1] - r, s.box[2] - s.box[0] + 2 * r, s.box[3] - s.box[1] + 2 * r)
+        const done = this.recordLayer(s.layer, ...this.strokeArea())
         this.composeStroke(layer.ctx)
         done(layer.used || !s.erase)
         this.stroke = null
