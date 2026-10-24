@@ -201,6 +201,7 @@ class Editor {
         this.space = false
         this.mouse = null
         this.hud = null
+        this.sizeNotches = 0
         this.build()
         this.setTool("crop")
         this.fit()
@@ -800,7 +801,14 @@ class Editor {
         const delta = (e.deltaY || e.deltaX) * (e.deltaMode === 1 ? 33 : 1)
         const notches = -delta / 100
         if (e.altKey) {
-            this.setBrush("size", this.brush.size * Math.pow(1.1, notches))
+            // A step of 10% per notch, but at least a pixel so small brushes change too. Touchpads
+            // send fractions of a notch, which add up to whole steps.
+            this.sizeNotches += notches
+            while (Math.abs(this.sizeNotches) >= 1) {
+                const dir = Math.sign(this.sizeNotches)
+                this.sizeNotches -= dir
+                this.setBrush("size", this.brush.size + dir * Math.max(1, Math.round(this.brush.size * 0.1)))
+            }
             this.showHud(`${this.brush.size} px`)
         } else if (e.shiftKey) {
             this.setBrush("opacity", this.brush.opacity + 0.05 * notches)
