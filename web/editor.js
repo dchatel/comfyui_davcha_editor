@@ -7,13 +7,14 @@ const CURSORS = {
     lt: "nwse-resize", rb: "nwse-resize", rt: "nesw-resize", lb: "nesw-resize",
     move: "move", rotate: `url("data:image/svg+xml,${encodeURIComponent(ROTATE_SVG)}") 12 12, crosshair`,
 }
-const MASK_COLOR = "#ff2060"
+const MASK_VIEWS = ["Color", "White", "Black", "Negative"]
+const SETTINGS = { view: "DavchaEditor.Mask.View", color: "DavchaEditor.Mask.Color", opacity: "DavchaEditor.Mask.Opacity" }
 const LAYERS = ["paint", "mask"]
 
 const HELP = {
     crop: "Frame edges: crop or pad (Shift: keep ratio, Alt: from center) · Inside: move · Outside: rotate (Shift: 15° steps)",
-    brush: "Alt+wheel: size · Shift+wheel: opacity · Ctrl+wheel: hardness · M: mask/paint",
-    eraser: "Alt+wheel: size · Shift+wheel: opacity · Ctrl+wheel: hardness · M: mask/paint",
+    brush: "Alt+wheel: size · Shift+wheel: opacity · Ctrl+wheel: hardness · M: mask/paint · Q: mask preview · Shift+Q: show/hide mask",
+    eraser: "Alt+wheel: size · Shift+wheel: opacity · Ctrl+wheel: hardness · M: mask/paint · Q: mask preview · Shift+Q: show/hide mask",
     hand: "Drag: pan",
 }
 
@@ -24,12 +25,13 @@ const STYLE = `
 .davcha-editor .de-sep { width: 1px; align-self: stretch; background: #3a3a3a; }
 .davcha-editor .de-options { display: flex; align-items: center; gap: 8px; }
 .davcha-editor input[type=number] { width: 56px; background: #111; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; }
+.davcha-editor select { background: #111; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; }
 .davcha-editor input[type=color] { width: 32px; height: 22px; padding: 0; border: 1px solid #444; background: none; }
 .davcha-editor button { background: #333; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 3px 10px; cursor: pointer; }
 .davcha-editor button:hover { background: #3c3c3c; }
 .davcha-editor button.de-active { background: #4a4a4a; border-color: #888; }
 .davcha-editor button.de-primary { background: #2b5fa8; border-color: #3a70bd; }
-.davcha-editor button:disabled { opacity: 0.5; cursor: default; }
+.davcha-editor button:disabled, .davcha-editor input:disabled { opacity: 0.5; cursor: default; }
 .davcha-editor .de-stage { position: relative; flex: 1; min-height: 0; }
 .davcha-editor .de-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; outline: none; }
 .davcha-editor .de-help { padding: 4px 10px; color: #888; font-size: 12px; background: #1b1b1b; border-top: 1px solid #333; }
@@ -126,9 +128,15 @@ class Editor {
         this.strokeCtx = this.strokeCanvas.getContext("2d")
         this.previewCanvas = this.newCanvas()
         this.previewCtx = this.previewCanvas.getContext("2d")
+        this.tintCanvas = this.newCanvas()
+        this.tintCtx = this.tintCanvas.getContext("2d")
         this.brush = { size: 40, opacity: 1, hardness: 0.8, color: "#ffffff" }
         this.target = "mask"
         this.showMask = true
+        const setting = app.extensionManager.setting
+        this.maskView = setting.get(SETTINGS.view)
+        this.maskColor = "#" + setting.get(SETTINGS.color).replace("#", "")
+        this.maskOpacity = setting.get(SETTINGS.opacity) / 100
         this.undoStack = []
         this.redoStack = []
         this.drag = null
@@ -166,8 +174,12 @@ class Editor {
     <label>Size <input class="de-size-input" type="number" min="1" max="2000"></label>
     <label>Opacity <input class="de-opacity" type="number" min="1" max="100"></label>
     <label>Hardness <input class="de-hardness" type="number" min="0" max="100"></label>
-    <label><input class="de-show-mask" type="checkbox"> Show mask</label>
     <button data-action="clear" title="Clear the current layer">Clear</button>
+    <span class="de-sep"></span>
+    <label><input class="de-show-mask" type="checkbox"> Show mask</label>
+    <select class="de-mask-view" title="Mask preview (Q)">${MASK_VIEWS.map((v) => `<option>${v}</option>`).join("")}</select>
+    <input class="de-mask-color" type="color" title="Mask preview color">
+    <label title="Preview only: the mask keeps its own values">Preview <input class="de-mask-opacity" type="number" min="0" max="100"></label>
   </span>
   <span class="de-size"></span>
   <span class="de-grow"></span>
@@ -190,11 +202,17 @@ class Editor {
             opacity: this.root.querySelector(".de-opacity"),
             hardness: this.root.querySelector(".de-hardness"),
             showMask: this.root.querySelector(".de-show-mask"),
+            maskView: this.root.querySelector(".de-mask-view"),
+            maskColor: this.root.querySelector(".de-mask-color"),
+            maskOpacity: this.root.querySelector(".de-mask-opacity"),
         }
         this.inputs.rotate.value = this.rotate
         this.inputs.fill.value = this.fill
         this.inputs.showMask.checked = this.showMask
+        this.inputs.maskColor.value = this.maskColor
+        this.inputs.maskOpacity.value = Math.round(this.maskOpacity * 100)
         this.syncBrushInputs()
+        this.setMaskView(this.maskView)
 
         this.root.querySelector(".de-bar").addEventListener("click", (e) => {
             const { action, tool, target } = e.target.dataset ?? {}
@@ -221,8 +239,17 @@ class Editor {
         this.inputs.size.addEventListener("change", () => this.setBrush("size", Number(this.inputs.size.value)))
         this.inputs.opacity.addEventListener("change", () => this.setBrush("opacity", Number(this.inputs.opacity.value) / 100))
         this.inputs.hardness.addEventListener("change", () => this.setBrush("hardness", Number(this.inputs.hardness.value) / 100))
-        this.inputs.showMask.addEventListener("change", () => {
-            this.showMask = this.inputs.showMask.checked
+        this.inputs.showMask.addEventListener("change", () => this.setShowMask(this.inputs.showMask.checked))
+        this.inputs.maskView.addEventListener("change", () => this.setMaskView(this.inputs.maskView.value))
+        this.inputs.maskColor.addEventListener("input", () => {
+            this.maskColor = this.inputs.maskColor.value
+            app.extensionManager.setting.set(SETTINGS.color, this.maskColor.slice(1))
+            this.redraw()
+        })
+        this.inputs.maskOpacity.addEventListener("change", () => {
+            this.maskOpacity = Math.min(Math.max(Number(this.inputs.maskOpacity.value) || 0, 0), 100) / 100
+            this.inputs.maskOpacity.value = Math.round(this.maskOpacity * 100)
+            app.extensionManager.setting.set(SETTINGS.opacity, Math.round(this.maskOpacity * 100))
             this.redraw()
         })
         this.canvas.addEventListener("pointerdown", (e) => this.onDown(e))
@@ -267,6 +294,22 @@ class Editor {
         this.target = target
         for (const b of this.root.querySelectorAll("[data-target]")) b.classList.toggle("de-active", b.dataset.target === target)
         this.inputs.color.style.display = target === "paint" ? "" : "none"
+    }
+
+    setMaskView(view) {
+        this.maskView = view
+        this.inputs.maskView.value = view
+        this.inputs.maskColor.style.display = view === "Color" ? "" : "none"
+        this.inputs.maskOpacity.disabled = view === "Negative"
+        const setting = app.extensionManager.setting
+        if (setting.get(SETTINGS.view) !== view) setting.set(SETTINGS.view, view)
+        this.redraw()
+    }
+
+    setShowMask(show) {
+        this.showMask = show
+        this.inputs.showMask.checked = show
+        this.redraw()
     }
 
     setBrush(key, value) {
@@ -591,7 +634,7 @@ class Editor {
         this.stroke = {
             layer: this.target,
             erase,
-            color: erase ? "#000000" : this.target === "mask" ? MASK_COLOR : this.brush.color,
+            color: this.target === "paint" && !erase ? this.brush.color : "#ffffff",
             opacity: this.brush.opacity,
             radius: this.brush.size / 2,
             hardness: this.brush.hardness,
@@ -702,6 +745,13 @@ class Editor {
             const tool = { c: "crop", b: "brush", e: "eraser", h: "hand" }[key]
             if (tool) this.setTool(tool)
             else if (key === "m") this.setTarget(this.target === "mask" ? "paint" : "mask")
+            else if (key === "q" && e.shiftKey) {
+                this.setShowMask(!this.showMask)
+                this.showHud(this.showMask ? "Mask shown" : "Mask hidden")
+            } else if (key === "q") {
+                this.setMaskView(MASK_VIEWS[(MASK_VIEWS.indexOf(this.maskView) + 1) % MASK_VIEWS.length])
+                this.showHud(`Mask preview: ${this.maskView}`)
+            }
         }
     }
 
@@ -748,10 +798,26 @@ class Editor {
                 this.composeStroke(this.previewCtx)
                 canvas = this.previewCanvas
             }
-            ctx.globalAlpha = name === "mask" ? 0.5 : 1
-            ctx.drawImage(canvas, 0, 0)
+            if (name === "mask") this.drawMask(ctx, canvas)
+            else ctx.drawImage(canvas, 0, 0)
         }
-        ctx.globalAlpha = 1
+    }
+
+    // Each mask pixel shows as a color with its own value times the preview opacity. Negative
+    // inverts the picture by the mask value alone: half an inversion is plain gray whatever the
+    // color, so a preview opacity would only gray the picture out.
+    drawMask(ctx, mask) {
+        const tint = this.tintCtx
+        tint.globalCompositeOperation = "copy"
+        tint.drawImage(mask, 0, 0)
+        tint.globalCompositeOperation = "source-in"
+        tint.fillStyle = { Color: this.maskColor, White: "#ffffff", Black: "#000000", Negative: "#ffffff" }[this.maskView]
+        tint.fillRect(0, 0, this.W, this.H)
+        ctx.save()
+        if (this.maskView === "Negative") ctx.globalCompositeOperation = "difference"
+        else ctx.globalAlpha = this.maskOpacity
+        ctx.drawImage(this.tintCanvas, 0, 0)
+        ctx.restore()
     }
 
     drawOverlay() {
@@ -967,6 +1033,11 @@ function setupGallery(node) {
 
 app.registerExtension({
     name: "comfyui_davcha_editor",
+    settings: [
+        { id: SETTINGS.view, name: "Mask preview", type: "combo", options: MASK_VIEWS, defaultValue: "Color" },
+        { id: SETTINGS.color, name: "Mask preview color", type: "color", defaultValue: "ff2060" },
+        { id: SETTINGS.opacity, name: "Mask preview opacity (%)", type: "number", defaultValue: 50, attrs: { min: 0, max: 100 } },
+    ],
     beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === "DavchaLoadImagesEditor") {
             const onNodeCreated = nodeType.prototype.onNodeCreated
