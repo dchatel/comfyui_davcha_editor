@@ -677,6 +677,17 @@ class Editor {
         this.redraw()
     }
 
+    // A plain layer above a pose layer, with the pose as pixels, to paint on. The pose layer stays editable.
+    copyAsImage(id) {
+        const source = this.layers[id]
+        const layer = this.newLayer({ name: `${source.name} (image)`, recipe: null, opacity: source.opacity }, source.canvas)
+        const index = this.stack.indexOf(id) + 1
+        this.insertLayer(layer, index)
+        this.push({ undo: () => this.removeLayer(layer.id), redo: () => this.insertLayer(layer, index) })
+        this.setTarget(layer.id)
+        this.redraw()
+    }
+
     deleteLayer(id) {
         const layer = this.layers[id]
         const index = this.removeLayer(id)
@@ -728,7 +739,8 @@ class Editor {
             const layer = this.layers[id]
             const el = row(id, layer.name)
             eye(el, layer.visible, (v) => (layer.visible = v))
-            el.insertAdjacentHTML("beforeend", `<label title="Opacity">◐ <input type="number" min="0" max="100"></label><button title="Run again">↻</button><button title="Delete">×</button>`)
+            el.insertAdjacentHTML("beforeend", `<label title="Opacity">◐ <input type="number" min="0" max="100"></label>${layer.pose ? `<button data-copy title="Copy as an image layer above, to paint on">⧉</button>` : ""}<button title="Run again">↻</button><button title="Delete">×</button>`)
+            el.querySelector("[data-copy]")?.addEventListener("click", () => this.copyAsImage(id))
             const opacity = el.querySelector("input[type=number]")
             opacity.value = Math.round(layer.opacity * 100)
             opacity.style.setProperty("--fill", `${opacity.value}%`)
@@ -740,7 +752,7 @@ class Editor {
             }
             opacity.addEventListener("change", () => setOpacity(Number(opacity.value) || 0))
             scrub(opacity, { min: 0, max: 100, span: 200 }, setOpacity)
-            const [again, remove] = el.querySelectorAll("button")
+            const [again, remove] = el.querySelectorAll("button:not([data-copy])")
             again.disabled = !!this.busy
             again.hidden = !layer.recipe
             again.addEventListener("click", () => this.regenerate(id))
