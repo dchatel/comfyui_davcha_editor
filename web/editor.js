@@ -84,7 +84,7 @@ const ICONS = Object.fromEntries(Object.entries({
 }).map(([name, paths]) => [name, `<svg viewBox="0 0 24 24">${paths}</svg>`]))
 
 const STYLE = `
-.davcha-editor { position: fixed; inset: 0; z-index: 10000; display: flex; flex-direction: column; background: #151515; color: #ddd; font: 13px sans-serif; }
+.davcha-editor { position: fixed; inset: 0; z-index: 9998; display: flex; flex-direction: column; background: #151515; color: #ddd; font: 13px sans-serif; }
 .davcha-editor .de-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #222; border-bottom: 1px solid #333; white-space: nowrap; }
 .davcha-editor .de-grow { flex: 1; }
 .davcha-editor .de-sep { width: 1px; align-self: stretch; background: #3a3a3a; }
@@ -192,7 +192,11 @@ async function fetchPreview(image, edit) {
 // A recipe runs one node on the picture: {name, node, inputs}, with the picture as its "image"
 // input and the node's defaults for the inputs it leaves out. user/default/davcha_editor/recipes.json
 // can add recipes or replace these by name.
+// A workflow recipe is a workflow saved in workflows/editor, with the picture in a Load Image
+// titled editor:in and the layer from a Preview Image titled editor:out. Once added, the layer keeps
+// its prompt, {name, prompt, inputs}, whose inputs are the widgets of the nodes titled editor:<name>.
 const RECIPES_FILE = `/userdata/${encodeURIComponent("davcha_editor/recipes.json")}`
+const WORKFLOWS_DIR = "workflows/editor"
 const DEFAULT_RECIPES = [
     { name: "Edges (Canny)", node: "Canny", inputs: { low_threshold: 0.4, high_threshold: 0.8 } },
     { name: "Depth (Depth Anything V2)", node: "DepthAnythingV2Preprocessor", inputs: { resolution: 1024 } },
@@ -223,7 +227,52 @@ async function loadRecipes() {
         const options = preprocessor[2].options.filter((p) => p !== "none")
         groups.push(["All AIO preprocessors", options.map((p) => ({ name: LiteGraph.registered_node_types[p]?.title ?? p, node: p, inputs: { resolution: 1024 } }))])
     }
+    const workflows = await api.fetchApi(`/userdata?dir=${encodeURIComponent(WORKFLOWS_DIR)}&recurse=true`)
+    if (workflows.ok) {
+        const files = (await workflows.json()).filter((f) => f.endsWith(".json")).sort()
+        if (files.length) groups.push(["Workflows", files.map((f) => ({ name: f.slice(0, -5), workflow: f }))])
+    }
     return groups
+}
+
+// A workflow file as a prompt, converted the way the Run button does. Files exported in the API
+// format are prompts already.
+async function workflowPrompt(file) {
+    const res = await api.fetchApi(`/userdata/${encodeURIComponent(`${WORKFLOWS_DIR}/${file}`)}`)
+    if (!res.ok) throw new Error(`Cannot read ${WORKFLOWS_DIR}/${file}: ${res.status}`)
+    const workflow = await res.json()
+    let prompt = workflow
+    if (workflow.nodes) {
+        const graph = new LiteGraph.LGraph()
+        graph.configure(workflow)
+        prompt = (await app.graphToPrompt(graph)).output
+    }
+    if (!editorNode(prompt, "editor:in") || !editorNode(prompt, "editor:out")) throw new Error(`${file} needs a Load Image titled editor:in and a Preview Image titled editor:out`)
+    return prompt
+}
+
+function editorNode(prompt, title) {
+    return Object.keys(prompt).find((id) => prompt[id]._meta?.title === title)
+}
+
+// Workflow recipe inputs are keyed "<node id>:<input>". Node ids inside subgraphs have colons too.
+function splitKey(key) {
+    const i = key.lastIndexOf(":")
+    return [key.slice(0, i), key.slice(i + 1)]
+}
+
+// The recipe's editable inputs as [key, label, type, options].
+async function recipeFields(recipe) {
+    if (!recipe.prompt) return (await nodeInputs(recipe.node)).map(([name, type, options]) => [name, name, type, options])
+    const fields = []
+    for (const [id, node] of Object.entries(recipe.prompt)) {
+        const title = node._meta?.title ?? ""
+        if (!title.startsWith("editor:") || title === "editor:in" || title === "editor:out") continue
+        for (const [name, type, options] of await nodeInputs(node.class_type)) {
+            if (name in node.inputs && !Array.isArray(node.inputs[name])) fields.push([`${id}:${name}`, `${title.slice(7)} · ${name}`, type, options])
+        }
+    }
+    return fields
 }
 
 const nodeSpecs = new Map()
@@ -248,9 +297,16 @@ function defaultInput(type, options) {
     return { COMBO: options.options?.[0], BOOLEAN: false, STRING: "" }[type] ?? options.min ?? 0
 }
 
-// The recipe with every input of its node, so a layer keeps all the values it ran with.
+// The recipe with all its inputs, so a layer keeps all the values it ran with. A workflow recipe
+// gets its prompt, and the values its editor:<name> nodes were saved with.
 async function fullRecipe(recipe) {
-    const inputs = Object.fromEntries((await nodeInputs(recipe.node)).map(([name, type, options]) => [name, defaultInput(type, options)]))
+    if (recipe.workflow) recipe = { name: recipe.name, prompt: await workflowPrompt(recipe.workflow) }
+    const value = (key, type, options) => {
+        if (!recipe.prompt) return defaultInput(type, options)
+        const [id, name] = splitKey(key)
+        return recipe.prompt[id].inputs[name]
+    }
+    const inputs = Object.fromEntries((await recipeFields(recipe)).map(([key, , type, options]) => [key, value(key, type, options)]))
     return { ...recipe, inputs: { ...inputs, ...recipe.inputs } }
 }
 
@@ -269,14 +325,28 @@ async function runRecipe(image, recipe) {
     const events = ["execution_success", "execution_error", "execution_interrupted"]
     for (const type of events) api.addEventListener(type, onEvent)
     try {
-        const prompt = {
-            dpp_load: { class_type: "LoadImage", inputs: { image } },
-            dpp_run: { class_type: recipe.node, inputs: { ...recipe.inputs, image: ["dpp_load", 0] } },
-            dpp_out: recipe.pose === undefined
-                ? { class_type: "PreviewImage", inputs: { images: ["dpp_run", 0] } }
-                : { class_type: "PreviewAny", inputs: { source: ["dpp_run", recipe.pose] } },
+        let prompt
+        let out = "dpp_out"
+        if (recipe.prompt) {
+            prompt = structuredClone(recipe.prompt)
+            for (const [key, value] of Object.entries(recipe.inputs)) {
+                const [id, name] = splitKey(key)
+                prompt[id].inputs[name] = value
+            }
+            prompt[editorNode(prompt, "editor:in")].inputs.image = image
+            out = editorNode(prompt, "editor:out")
+        } else {
+            prompt = {
+                dpp_load: { class_type: "LoadImage", inputs: { image } },
+                dpp_run: { class_type: recipe.node, inputs: { ...recipe.inputs, image: ["dpp_load", 0] } },
+                dpp_out: recipe.pose === undefined
+                    ? { class_type: "PreviewImage", inputs: { images: ["dpp_run", 0] } }
+                    : { class_type: "PreviewAny", inputs: { source: ["dpp_run", recipe.pose] } },
+            }
         }
-        const res = await api.fetchApi("/prompt", { method: "POST", body: JSON.stringify({ prompt, client_id: api.clientId, front: true }) })
+        // Only what the result needs runs: a workflow's other outputs, such as Save Image, don't.
+        const body = { prompt, client_id: api.clientId, front: true, partial_execution_targets: [out] }
+        const res = await api.fetchApi("/prompt", { method: "POST", body: JSON.stringify(body) })
         const queued = await res.json()
         if (!res.ok) {
             const details = Object.values(queued.node_errors ?? {}).flatMap((n) => n.errors.map((e) => e.details || e.message))
@@ -286,7 +356,7 @@ async function runRecipe(image, recipe) {
         if (!finished.has(promptId)) await new Promise((resolve) => (settle = resolve))
         if (finished.get(promptId)) throw new Error(finished.get(promptId))
         const history = await (await api.fetchApi(`/history/${promptId}`)).json()
-        const output = history[promptId].outputs.dpp_out
+        const output = history[promptId].outputs[out]
         await api.fetchApi("/history", { method: "POST", body: JSON.stringify({ delete: [promptId] }) })
         if (recipe.pose !== undefined) return JSON.parse(output.text[0])[0]
         const { filename, subfolder, type } = output.images[0]
@@ -804,7 +874,7 @@ class Editor {
                     for (const recipe of recipes) {
                         const option = new Option(recipe.name, this.recipes.length)
                         this.recipes.push(recipe)
-                        if (!LiteGraph.registered_node_types[recipe.node]) {
+                        if (recipe.node && !LiteGraph.registered_node_types[recipe.node]) {
                             option.disabled = true
                             option.textContent += ` (needs ${recipe.node})`
                         }
@@ -921,22 +991,23 @@ class Editor {
         fields.replaceChildren()
         section.hidden = !recipe
         if (!recipe) return
-        section.querySelector(".dp-node").textContent = LiteGraph.registered_node_types[recipe.node]?.title ?? recipe.node
+        section.querySelector(".dp-node").textContent = recipe.prompt ? recipe.name : LiteGraph.registered_node_types[recipe.node]?.title ?? recipe.node
         section.querySelector(".dp-name").value = recipe.name
         let specs
         try {
-            specs = await nodeInputs(recipe.node)
+            specs = await recipeFields(recipe)
         } catch {
-            fields.textContent = `Needs the ${recipe.node} node`
+            fields.textContent = recipe.prompt ? "A node of the workflow is missing" : `Needs the ${recipe.node} node`
             return
         }
         if (id !== this.propsTarget || recipe !== this.propsRecipe) return
         const layer = this.layers[id]
-        for (const [name, type, options] of specs) {
+        if (!specs.length && recipe.prompt) fields.textContent = "Title nodes editor:<name> in the workflow to set their values here"
+        for (const [key, name, type, options] of specs) {
             const label = document.createElement("label")
             label.append(name)
             label.title = options.tooltip ?? name
-            const value = recipe.inputs[name] ?? defaultInput(type, options)
+            const value = recipe.inputs[key] ?? defaultInput(type, options)
             let input
             let read
             let field = null
@@ -971,7 +1042,7 @@ class Editor {
             label.append(input)
             input.addEventListener("change", () => {
                 const before = layer.recipe
-                this.setInput(layer, name, read())
+                this.setInput(layer, key, read())
                 this.pushRecipe(layer, before)
             })
             if (field) {
@@ -979,7 +1050,7 @@ class Editor {
                 scrub(input, field, (v, done) => {
                     before ??= layer.recipe
                     input.value = v
-                    this.setInput(layer, name, read())
+                    this.setInput(layer, key, read())
                     if (!done) return
                     this.pushRecipe(layer, before)
                     before = null
