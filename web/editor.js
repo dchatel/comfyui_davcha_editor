@@ -89,9 +89,12 @@ const STYLE = `
 .davcha-editor .de-grow { flex: 1; }
 .davcha-editor .de-sep { width: 1px; align-self: stretch; background: #3a3a3a; }
 .davcha-editor .de-body { display: flex; flex: 1; min-height: 0; }
-.davcha-editor .de-panel { width: 290px; display: flex; flex-direction: column; gap: 6px; padding: 8px; overflow-y: auto; background: #1d1d1d; border-left: 1px solid #333; }
-.davcha-editor .de-panel-title { font-weight: bold; color: #aaa; margin-top: 4px; }
-.davcha-editor .de-tools { display: flex; gap: 4px; }
+.davcha-editor .de-panel { width: 290px; display: flex; flex-direction: column; gap: 8px; padding: 8px; overflow-y: auto; background: #1a1a1a; border-left: 1px solid #333; }
+.davcha-editor .de-section { display: flex; flex-direction: column; gap: 6px; padding: 8px; background: #222; border: 1px solid #333; border-radius: 6px; }
+.davcha-editor .de-panel-title { font-weight: bold; color: #aaa; }
+.davcha-editor .de-tools { flex-direction: row; gap: 4px; }
+.davcha-editor .de-tools button { flex: 1; padding: 6px 0; }
+.davcha-editor .de-tools svg { width: 20px; height: 20px; }
 .davcha-editor button.de-icon { display: inline-flex; align-items: center; justify-content: center; padding: 3px 6px; }
 .davcha-editor button svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
 .davcha-editor .de-options { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
@@ -440,30 +443,34 @@ class Editor {
 <div class="de-body">
   <div class="de-stage"><canvas class="de-main"></canvas><canvas class="de-overlay" tabindex="0"></canvas></div>
   <div class="de-panel">
-    <div class="de-tools">
+    <div class="de-section de-tools">
       <button class="de-icon" data-tool="crop" title="Crop, pad and rotate (C)">${ICONS.crop}</button><button class="de-icon" data-tool="brush" title="Brush (B)">${ICONS.brush}</button><button class="de-icon" data-tool="eraser" title="Eraser (E)">${ICONS.eraser}</button><button class="de-icon" data-tool="pose" title="Edit pose layers (P)">${ICONS.pose}</button><button class="de-icon" data-tool="hand" title="Pan (H)">${ICONS.hand}</button>
     </div>
-    <div class="de-panel-title de-tool-name"></div>
-    <div class="de-options" data-for="crop">
-      <label>Rotate <input class="de-rotate" type="number" step="0.1"></label>
-      <button data-action="ccw">⟲ 90°</button><button data-action="cw">⟳ 90°</button>
-      <label>Fill <input class="de-fill" type="color"></label>
-      <span class="de-size"></span>
+    <div class="de-section">
+      <div class="de-panel-title de-tool-name"></div>
+      <div class="de-options" data-for="crop">
+        <label>Rotate <input class="de-rotate" type="number" step="0.1"></label>
+        <button data-action="ccw">⟲ 90°</button><button data-action="cw">⟳ 90°</button>
+        <label>Fill <input class="de-fill" type="color"></label>
+        <span class="de-size"></span>
+      </div>
+      <div class="de-options" data-for="pose">
+        <button data-pose-mode="move" title="Drag moves the selected points (R)">Move</button><button data-pose-mode="rotate" title="Drag turns the selected points about their nearest unselected common parent (R)">Rotate</button>
+        <button data-action="add-person" title="Add a standing person, in a new pose layer if there is none">Add person</button><button data-action="delete-person" title="Delete the people with selected points (Del)">Delete person</button>
+      </div>
+      <div class="de-options" data-for="brush eraser">
+        <button class="de-icon" data-target="mask" title="Paint on the mask (M)">${ICONS.mask}</button><button class="de-icon" data-target="paint" title="Paint on the picture (M)">${ICONS.paint}</button>
+        <input class="de-color" type="color" title="Paint color">
+        <label>Size <input class="de-size-input" type="number" min="1" max="2000"></label>
+        <label>Opacity <input class="de-opacity" type="number" min="1" max="100"></label>
+        <label>Hardness <input class="de-hardness" type="number" min="0" max="100"></label>
+        <button data-action="clear" title="Clear the current layer">Clear</button><button data-action="invert" title="Invert the mask (Ctrl+I)">Invert mask</button>
+      </div>
     </div>
-    <div class="de-options" data-for="pose">
-      <button data-pose-mode="move" title="Drag moves the selected points (R)">Move</button><button data-pose-mode="rotate" title="Drag turns the selected points about their nearest unselected common parent (R)">Rotate</button>
-      <button data-action="add-person" title="Add a standing person, in a new pose layer if there is none">Add person</button><button data-action="delete-person" title="Delete the people with selected points (Del)">Delete person</button>
+    <div class="de-section">
+      <div class="de-panel-title">Layers</div>
+      <select class="dl-add"><option value="">Add from recipe…</option></select><div class="dl-status"></div><div class="dl-list"></div>
     </div>
-    <div class="de-options" data-for="brush eraser">
-      <button class="de-icon" data-target="mask" title="Paint on the mask (M)">${ICONS.mask}</button><button class="de-icon" data-target="paint" title="Paint on the picture (M)">${ICONS.paint}</button>
-      <input class="de-color" type="color" title="Paint color">
-      <label>Size <input class="de-size-input" type="number" min="1" max="2000"></label>
-      <label>Opacity <input class="de-opacity" type="number" min="1" max="100"></label>
-      <label>Hardness <input class="de-hardness" type="number" min="0" max="100"></label>
-      <button data-action="clear" title="Clear the current layer">Clear</button><button data-action="invert" title="Invert the mask (Ctrl+I)">Invert mask</button>
-    </div>
-    <div class="de-panel-title">Layers</div>
-    <select class="dl-add"><option value="">Add from recipe…</option></select><div class="dl-status"></div><div class="dl-list"></div>
   </div>
 </div>
 <div class="de-help"></div>`
