@@ -98,11 +98,17 @@ const STYLE = `
 .davcha-editor button.de-icon { display: inline-flex; align-items: center; justify-content: center; padding: 3px 6px; }
 .davcha-editor button svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
 .davcha-editor .de-options { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.davcha-editor .de-options label { flex-basis: 100%; display: flex; align-items: center; justify-content: space-between; }
+.davcha-editor .de-options label, .davcha-editor .de-fields label { flex-basis: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.davcha-editor .de-fields { display: flex; flex-direction: column; gap: 6px; }
+.davcha-editor .de-fields select, .davcha-editor .de-fields input[type=text] { width: 150px; }
+.davcha-editor .de-section[hidden] { display: none; }
+.davcha-editor .dp-save-row { display: flex; gap: 6px; }
+.davcha-editor .dp-name { flex: 1; min-width: 0; }
+.davcha-editor button.de-stale { border-color: #d08a2a; color: #f0b060; }
 .davcha-editor .de-size { color: #888; }
 .davcha-editor input[type=number] { width: 56px; background: linear-gradient(to right, #2c4466 var(--fill, 0%), #111 var(--fill, 0%)); color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; }
 .davcha-editor label.de-scrub { cursor: ew-resize; user-select: none; }
-.davcha-editor select { background: #111; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; }
+.davcha-editor select, .davcha-editor input[type=text] { background: #111; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; }
 .davcha-editor input[type=color] { width: 32px; height: 22px; padding: 0; border: 1px solid #444; background: none; }
 .davcha-editor button { background: #333; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 3px 10px; cursor: pointer; }
 .davcha-editor button:hover { background: #3c3c3c; }
@@ -184,38 +190,68 @@ async function fetchPreview(image, edit) {
 }
 
 // A recipe runs one node on the picture: {name, node, inputs}, with the picture as its "image"
-// input. user/default/davcha_editor/recipes.json can add recipes or replace these by name.
+// input and the node's defaults for the inputs it leaves out. user/default/davcha_editor/recipes.json
+// can add recipes or replace these by name.
+const RECIPES_FILE = `/userdata/${encodeURIComponent("davcha_editor/recipes.json")}`
 const DEFAULT_RECIPES = [
     { name: "Edges (Canny)", node: "Canny", inputs: { low_threshold: 0.4, high_threshold: 0.8 } },
-    { name: "Depth (Depth Anything V2)", node: "AIO_Preprocessor", inputs: { preprocessor: "DepthAnythingV2Preprocessor", resolution: 1024 } },
-    { name: "Lineart (realistic)", node: "AIO_Preprocessor", inputs: { preprocessor: "LineArtPreprocessor", resolution: 1024 } },
-    { name: "Lineart (anime)", node: "AIO_Preprocessor", inputs: { preprocessor: "AnimeLineArtPreprocessor", resolution: 1024 } },
-    { name: "Lineart (standard)", node: "AIO_Preprocessor", inputs: { preprocessor: "LineartStandardPreprocessor", resolution: 1024 } },
-    { name: "Soft edges (HED)", node: "AIO_Preprocessor", inputs: { preprocessor: "HEDPreprocessor", resolution: 1024 } },
-    { name: "Scribble", node: "AIO_Preprocessor", inputs: { preprocessor: "ScribblePreprocessor", resolution: 1024 } },
-    { name: "Pose (DWPose)", node: "AIO_Preprocessor", inputs: { preprocessor: "DWPreprocessor", resolution: 1024 } },
+    { name: "Depth (Depth Anything V2)", node: "DepthAnythingV2Preprocessor", inputs: { resolution: 1024 } },
+    { name: "Lineart (realistic)", node: "LineArtPreprocessor", inputs: { resolution: 1024 } },
+    { name: "Lineart (anime)", node: "AnimeLineArtPreprocessor", inputs: { resolution: 1024 } },
+    { name: "Lineart (standard)", node: "LineartStandardPreprocessor", inputs: { resolution: 1024 } },
+    { name: "Soft edges (HED)", node: "HEDPreprocessor", inputs: { resolution: 1024 } },
+    { name: "Scribble", node: "ScribblePreprocessor", inputs: { resolution: 1024 } },
+    { name: "Pose (DWPose)", node: "DWPreprocessor", inputs: { resolution: 1024 } },
     // `pose` is the node output holding the OpenPose keypoints: the layer keeps them, editable.
     {
         name: "Pose (DWPose, editable)", node: "DWPreprocessor", pose: 1,
         inputs: { detect_hand: "enable", detect_body: "enable", detect_face: "enable", resolution: 1024, bbox_detector: "yolox_l.onnx", pose_estimator: "dw-ll_ucoco_384_bs5.torchscript.pt", scale_stick_for_xinsr_cn: "disable" },
     },
-    { name: "Normal map (BAE)", node: "AIO_Preprocessor", inputs: { preprocessor: "BAE-NormalMapPreprocessor", resolution: 1024 } },
+    { name: "Normal map (BAE)", node: "BAE-NormalMapPreprocessor", inputs: { resolution: 1024 } },
 ]
 
 // Returns [label, recipes] groups: the recipes above, then every preprocessor AIO_Preprocessor
-// offers, read from the node itself so the list follows the installed controlnet_aux.
+// offers, read from the node itself so the list follows the installed controlnet_aux. Its options
+// are the names of the preprocessor nodes, which recipes run directly to reach all their inputs.
 async function loadRecipes() {
     const recipes = new Map(DEFAULT_RECIPES.map((r) => [r.name, r]))
-    const res = await api.fetchApi(`/userdata/${encodeURIComponent("davcha_editor/recipes.json")}`)
+    const res = await api.fetchApi(RECIPES_FILE)
     if (res.ok) for (const r of await res.json()) recipes.set(r.name, r)
     const groups = [["Recipes", [...recipes.values()]]]
     if (LiteGraph.registered_node_types.AIO_Preprocessor) {
-        const { AIO_Preprocessor } = await (await api.fetchApi("/object_info/AIO_Preprocessor")).json()
-        const spec = { ...AIO_Preprocessor.input.required, ...AIO_Preprocessor.input.optional }.preprocessor
-        const options = (Array.isArray(spec[0]) ? spec[0] : spec[1].options).filter((p) => p !== "none")
-        groups.push(["All AIO preprocessors", options.map((p) => ({ name: p, node: "AIO_Preprocessor", inputs: { preprocessor: p, resolution: 1024 } }))])
+        const preprocessor = (await nodeInputs("AIO_Preprocessor")).find(([name]) => name === "preprocessor")
+        const options = preprocessor[2].options.filter((p) => p !== "none")
+        groups.push(["All AIO preprocessors", options.map((p) => ({ name: LiteGraph.registered_node_types[p]?.title ?? p, node: p, inputs: { resolution: 1024 } }))])
     }
     return groups
+}
+
+const nodeSpecs = new Map()
+
+// A node's widget inputs as [name, type, options], read once from /object_info. Combos have their
+// choices in options.options, as in the newer format.
+function nodeInputs(node) {
+    if (!nodeSpecs.has(node)) {
+        nodeSpecs.set(node, api.fetchApi(`/object_info/${encodeURIComponent(node)}`).then(async (res) => {
+            const { required = {}, optional = {} } = (await res.json())[node].input
+            return Object.entries({ ...required, ...optional }).flatMap(([name, [type, options = {}]]) => {
+                if (Array.isArray(type)) return [[name, "COMBO", { ...options, options: type }]]
+                return ["INT", "FLOAT", "BOOLEAN", "STRING", "COMBO"].includes(type) && !options.forceInput ? [[name, type, options]] : []
+            })
+        }))
+    }
+    return nodeSpecs.get(node)
+}
+
+function defaultInput(type, options) {
+    if (options.default !== undefined) return options.default
+    return { COMBO: options.options?.[0], BOOLEAN: false, STRING: "" }[type] ?? options.min ?? 0
+}
+
+// The recipe with every input of its node, so a layer keeps all the values it ran with.
+async function fullRecipe(recipe) {
+    const inputs = Object.fromEntries((await nodeInputs(recipe.node)).map(([name, type, options]) => [name, defaultInput(type, options)]))
+    return { ...recipe, inputs: { ...inputs, ...recipe.inputs } }
 }
 
 // Queues a three-node prompt (load the picture, run the recipe, preview the result) like the Run
@@ -471,6 +507,12 @@ class Editor {
       <div class="de-panel-title">Layers</div>
       <select class="dl-add"><option value="">Add from recipe…</option></select><div class="dl-status"></div><div class="dl-list"></div>
     </div>
+    <div class="de-section de-props" hidden>
+      <div class="de-panel-title dp-node"></div>
+      <div class="de-fields"></div>
+      <div><button class="dp-run" title="Run the recipe again with these values">↻ Run</button></div>
+      <div class="dp-save-row"><input class="dp-name" type="text" placeholder="Recipe name"><button class="dp-save" title="Add these values to the recipes menu, replacing the recipe of the same name">Save as recipe</button></div>
+    </div>
   </div>
 </div>
 <div class="de-help"></div>`
@@ -500,29 +542,16 @@ class Editor {
         this.syncBrushInputs()
         this.setMaskView(this.maskView)
         const add = this.root.querySelector(".dl-add")
-        this.recipes = []
-        loadRecipes()
-            .then((groups) => {
-                for (const [label, recipes] of groups) {
-                    const group = Object.assign(document.createElement("optgroup"), { label })
-                    // A recipe whose node isn't installed, or failed to load, shows which one it needs.
-                    for (const recipe of recipes) {
-                        const option = new Option(recipe.name, this.recipes.length)
-                        this.recipes.push(recipe)
-                        if (!LiteGraph.registered_node_types[recipe.node]) {
-                            option.disabled = true
-                            option.textContent += ` (needs ${recipe.node})`
-                        }
-                        group.append(option)
-                    }
-                    add.append(group)
-                }
-            })
-            .catch(showError)
+        this.fillRecipes()
         add.addEventListener("change", () => {
             const recipe = this.recipes[Number(add.value)]
             add.value = ""
             this.addFromRecipe(recipe)
+        })
+        this.root.querySelector(".dp-run").addEventListener("click", () => this.regenerate(this.target))
+        this.root.querySelector(".dp-save").addEventListener("click", () => {
+            const name = this.root.querySelector(".dp-name").value.trim()
+            if (name) this.saveRecipe({ ...this.layers[this.target].recipe, name }).catch(showError)
         })
 
         this.root.addEventListener("click", (e) => {
@@ -644,11 +673,13 @@ class Editor {
     }
 
     // A recipe layer: its result stretched over the picture, which is where the recipe ran. A pose
-    // layer keeps its people instead, and is drawn from them.
-    newLayer({ name, recipe, visible = true, opacity = 1, pose }, result) {
+    // layer keeps its people instead, and is drawn from them. `ran` holds the inputs the result
+    // comes from, which differ from the recipe's once its values are changed and not run again.
+    newLayer({ name, recipe, visible = true, opacity = 1, pose, stale }, result) {
         const canvas = this.newCanvas()
         const ctx = canvas.getContext("2d")
-        const layer = { id: `layer${this.nextLayer++}`, canvas, ctx, used: true, name, recipe, visible, opacity, pose }
+        const ran = recipe && !stale ? JSON.stringify(recipe.inputs) : null
+        const layer = { id: `layer${this.nextLayer++}`, canvas, ctx, used: true, name, recipe, ran, visible, opacity, pose }
         if (pose) drawPoses(ctx, pose, this.W, this.H)
         else ctx.drawImage(result, 0, 0, this.W, this.H)
         return layer
@@ -687,6 +718,11 @@ class Editor {
     }
 
     async addFromRecipe(recipe) {
+        try {
+            recipe = await fullRecipe(recipe)
+        } catch (error) {
+            return showError(error)
+        }
         const result = await this.run(recipe)
         if (!result) return
         const pose = recipe.pose === undefined ? undefined : readPoses(result, this.W, this.H)
@@ -698,15 +734,86 @@ class Editor {
         this.redraw()
     }
 
+    // Runs the layer's recipe with its current values. Values changed during the run stay pending.
     async regenerate(id) {
-        const result = await this.run(this.layers[id].recipe)
+        const layer = this.layers[id]
+        const recipe = layer.recipe
+        const result = await this.run(recipe)
         if (!result || !this.layers[id]) return
-        if (this.layers[id].pose) return this.setPose(this.layers[id], readPoses(result, this.W, this.H))
-        const done = this.recordLayer(id, 0, 0, this.W, this.H)
-        this.layers[id].ctx.clearRect(0, 0, this.W, this.H)
-        this.layers[id].ctx.drawImage(result, 0, 0, this.W, this.H)
-        done(true)
+        const before = this.layerState(layer)
+        if (layer.pose) {
+            this.applyPose(layer, readPoses(result, this.W, this.H))
+        } else {
+            layer.ctx.clearRect(0, 0, this.W, this.H)
+            layer.ctx.drawImage(result, 0, 0, this.W, this.H)
+        }
+        layer.ran = JSON.stringify(recipe.inputs)
+        const after = this.layerState(layer)
+        this.push({ undo: () => this.setLayerState(layer, before), redo: () => this.setLayerState(layer, after) })
+        this.renderLayers()
         this.redraw()
+    }
+
+    layerState(layer) {
+        return { pixels: layer.ctx.getImageData(0, 0, this.W, this.H), pose: layer.pose, ran: layer.ran }
+    }
+
+    setLayerState(layer, state) {
+        layer.ctx.putImageData(state.pixels, 0, 0)
+        layer.pose = state.pose
+        layer.ran = state.ran
+    }
+
+    isStale(layer) {
+        return !!layer.recipe && layer.ran !== JSON.stringify(layer.recipe.inputs)
+    }
+
+    // Recipes are never changed afterwards: a new value makes a new recipe, so the history can
+    // keep them. The properties panel is told, as it already shows the value.
+    setInput(layer, name, value) {
+        layer.recipe = { ...layer.recipe, inputs: { ...layer.recipe.inputs, [name]: value } }
+        this.propsRecipe = layer.recipe
+        this.renderLayers()
+    }
+
+    pushRecipe(layer, before) {
+        const after = layer.recipe
+        if (before !== after) this.push({ undo: () => (layer.recipe = before), redo: () => (layer.recipe = after) })
+    }
+
+    // Adds the recipe to user recipes, replacing the one with the same name.
+    async saveRecipe(recipe) {
+        const res = await api.fetchApi(RECIPES_FILE)
+        const recipes = res.ok ? (await res.json()).filter((r) => r.name !== recipe.name) : []
+        recipes.push(recipe)
+        const saved = await api.fetchApi(`${RECIPES_FILE}?overwrite=true`, { method: "POST", body: JSON.stringify(recipes, null, 4) })
+        if (!saved.ok) throw new Error(`Saving the recipe failed: ${saved.status}`)
+        this.fillRecipes()
+        this.showHud(`Saved recipe ${recipe.name}`)
+    }
+
+    fillRecipes() {
+        const add = this.root.querySelector(".dl-add")
+        add.replaceChildren(new Option("Add from recipe…", ""))
+        this.recipes = []
+        loadRecipes()
+            .then((groups) => {
+                for (const [label, recipes] of groups) {
+                    const group = Object.assign(document.createElement("optgroup"), { label })
+                    // A recipe whose node isn't installed, or failed to load, shows which one it needs.
+                    for (const recipe of recipes) {
+                        const option = new Option(recipe.name, this.recipes.length)
+                        this.recipes.push(recipe)
+                        if (!LiteGraph.registered_node_types[recipe.node]) {
+                            option.disabled = true
+                            option.textContent += ` (needs ${recipe.node})`
+                        }
+                        group.append(option)
+                    }
+                    add.append(group)
+                }
+            })
+            .catch(showError)
     }
 
     // A plain layer above a pose layer, with the pose as pixels, to paint on. The pose layer stays editable.
@@ -787,12 +894,99 @@ class Editor {
             const [again, remove] = el.querySelectorAll("button:not([data-copy])")
             again.disabled = !!this.busy
             again.hidden = !layer.recipe
+            again.classList.toggle("de-stale", this.isStale(layer))
+            if (this.isStale(layer)) again.title = "Run again: the values changed since the last run"
             again.addEventListener("click", () => this.regenerate(id))
             remove.addEventListener("click", () => this.deleteLayer(id))
         }
         eye(row(null, "Image"), this.imageVisible, (v) => (this.imageVisible = v))
         this.root.querySelector(".dl-add").disabled = !!this.busy
         this.root.querySelector(".dl-status").textContent = this.busy ? `Running ${this.busy}…` : ""
+        const run = this.root.querySelector(".dp-run")
+        run.disabled = !!this.busy
+        run.classList.toggle("de-stale", !!this.layers[this.target] && this.isStale(this.layers[this.target]))
+        this.renderProperties()
+    }
+
+    // The inputs of the target layer's recipe node, rebuilt only when the layer or its recipe
+    // changes otherwise than through these fields.
+    async renderProperties() {
+        const id = this.target
+        const recipe = this.layers[id]?.recipe
+        if (id === this.propsTarget && recipe === this.propsRecipe) return
+        this.propsTarget = id
+        this.propsRecipe = recipe
+        const section = this.root.querySelector(".de-props")
+        const fields = section.querySelector(".de-fields")
+        fields.replaceChildren()
+        section.hidden = !recipe
+        if (!recipe) return
+        section.querySelector(".dp-node").textContent = LiteGraph.registered_node_types[recipe.node]?.title ?? recipe.node
+        section.querySelector(".dp-name").value = recipe.name
+        let specs
+        try {
+            specs = await nodeInputs(recipe.node)
+        } catch {
+            fields.textContent = `Needs the ${recipe.node} node`
+            return
+        }
+        if (id !== this.propsTarget || recipe !== this.propsRecipe) return
+        const layer = this.layers[id]
+        for (const [name, type, options] of specs) {
+            const label = document.createElement("label")
+            label.append(name)
+            label.title = options.tooltip ?? name
+            const value = recipe.inputs[name] ?? defaultInput(type, options)
+            let input
+            let read
+            let field = null
+            if (type === "COMBO") {
+                input = document.createElement("select")
+                input.append(...options.options.map((o) => new Option(o, o)))
+                input.value = value
+                read = () => input.value
+            } else if (type === "BOOLEAN") {
+                input = Object.assign(document.createElement("input"), { type: "checkbox", checked: value })
+                read = () => input.checked
+            } else if (type === "STRING") {
+                input = Object.assign(document.createElement("input"), { type: "text", value })
+                read = () => input.value
+            } else {
+                const step = options.step ?? (type === "INT" ? 1 : 0.01)
+                const decimals = type === "INT" ? 0 : Math.max(0, -Math.floor(Math.log10(step)))
+                const snap = (v) => {
+                    v = Math.min(Math.max(v, options.min ?? -Infinity), options.max ?? Infinity)
+                    return Number(((options.min ?? 0) + Math.round((v - (options.min ?? 0)) / step) * step).toFixed(decimals))
+                }
+                input = Object.assign(document.createElement("input"), { type: "number", value, step })
+                // About one pixel per step, within a reasonable drag.
+                if (options.min !== undefined && options.max !== undefined) field = { min: options.min, max: options.max, span: Math.min(Math.max((options.max - options.min) / step, 100), 400), decimals }
+                read = () => {
+                    input.value = snap(Number(input.value) || 0)
+                    if (field) input.style.setProperty("--fill", `${fieldPosition(field, Number(input.value)) * 100}%`)
+                    return Number(input.value)
+                }
+                read()
+            }
+            label.append(input)
+            input.addEventListener("change", () => {
+                const before = layer.recipe
+                this.setInput(layer, name, read())
+                this.pushRecipe(layer, before)
+            })
+            if (field) {
+                let before = null
+                scrub(input, field, (v, done) => {
+                    before ??= layer.recipe
+                    input.value = v
+                    this.setInput(layer, name, read())
+                    if (!done) return
+                    this.pushRecipe(layer, before)
+                    before = null
+                })
+            }
+            fields.append(label)
+        }
     }
 
     setMaskView(view) {
@@ -871,7 +1065,7 @@ class Editor {
                 edit.layers = []
                 for (const id of this.stack) {
                     const { canvas, name, recipe, visible, opacity, pose } = this.layers[id]
-                    edit.layers.push({ file: await uploadLayer(canvas), name, recipe, visible, opacity, ...(pose && { pose }) })
+                    edit.layers.push({ file: await uploadLayer(canvas), name, recipe, visible, opacity, ...(pose && { pose }), ...(this.isStale(this.layers[id]) && { stale: true }) })
                 }
             }
         } catch (error) {
