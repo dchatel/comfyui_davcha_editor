@@ -127,9 +127,10 @@ const STYLE = `
 .davcha-editor .dl-row input[type=number] { width: 50px; }
 .davcha-editor .dl-row button { padding: 0 6px; }
 .davcha-gallery { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 6px; padding: 4px; overflow-y: auto; box-sizing: border-box; }
-.davcha-gallery .dg-tile { position: relative; width: 84px; height: 84px; box-sizing: border-box; border: 1px solid #444; border-radius: 4px; overflow: hidden; background: #1b1b1b; cursor: pointer; }
+.davcha-gallery .dg-tile { position: relative; width: 84px; height: 84px; box-sizing: border-box; border: 1px solid #444; border-radius: 4px; overflow: hidden; background: #1b1b1b; cursor: pointer; touch-action: none; }
 .davcha-gallery .dg-tile img { width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
 .davcha-gallery .dg-tile.dg-over { outline: 2px solid #3a70bd; }
+.davcha-gallery .dg-tile.dg-dragging { opacity: 0.4; }
 .davcha-gallery .dg-badge { position: absolute; left: 2px; bottom: 2px; padding: 0 4px; border-radius: 3px; background: rgba(0, 0, 0, 0.7); color: #fff; font: 10px sans-serif; }
 .davcha-gallery .dg-remove { display: none; position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; border-radius: 9px; background: rgba(0, 0, 0, 0.7); color: #fff; font: 13px/18px sans-serif; text-align: center; }
 .davcha-gallery .dg-tile:hover .dg-remove { display: block; }
@@ -2016,7 +2017,6 @@ function setupGallery(node) {
     gallery.className = "davcha-gallery"
     const fileInput = Object.assign(document.createElement("input"), { type: "file", accept: "image/*", multiple: true })
     const entries = () => JSON.parse(widget.value || "[]")
-    let dragged = null
 
     const save = (list) => {
         widget.value = JSON.stringify(list)
@@ -2037,42 +2037,55 @@ function setupGallery(node) {
         entries().forEach((entry, i) => {
             const tile = document.createElement("div")
             tile.className = "dg-tile"
-            tile.draggable = true
             tile.title = entry.image
             tile.innerHTML = `<img><span class="dg-badge">${i + 1}${entry.edit ? " ✎" : ""}</span><span class="dg-remove" title="Remove">×</span>`
             thumbnailUrl(entry).then((url) => (tile.querySelector("img").src = url))
-            tile.addEventListener("click", () =>
-                editPicture(entry.image, entry.edit, (edit) => {
-                    const list = entries()
-                    list[i].edit = edit
-                    save(list)
-                }),
-            )
             tile.querySelector(".dg-remove").addEventListener("click", (e) => {
                 e.stopPropagation()
                 const list = entries()
                 list.splice(i, 1)
                 save(list)
             })
-            tile.addEventListener("dragstart", (e) => {
-                dragged = i
-                e.dataTransfer.effectAllowed = "move"
-            })
-            tile.addEventListener("dragend", () => (dragged = null))
-            tile.addEventListener("dragover", (e) => {
-                if (dragged === null) return
-                e.preventDefault()
-                tile.classList.add("dg-over")
-            })
-            tile.addEventListener("dragleave", () => tile.classList.remove("dg-over"))
-            tile.addEventListener("drop", (e) => {
-                if (dragged === null) return
-                e.preventDefault()
+            // A click edits the picture; a drag moves it to the place of the tile it is dropped on.
+            // Pointer events, as the canvas keeps native drag and drop from starting in node widgets.
+            tile.addEventListener("pointerdown", (e) => {
+                if (e.button !== 0 || e.target.closest(".dg-remove")) return
                 e.stopPropagation()
-                const list = entries()
-                list.splice(i, 0, ...list.splice(dragged, 1))
-                dragged = null
-                save(list)
+                tile.setPointerCapture(e.pointerId)
+                let moved = false
+                let target = null
+                const move = (ev) => {
+                    if (!moved && Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 5) return
+                    moved = true
+                    tile.classList.add("dg-dragging")
+                    const over = document.elementFromPoint(ev.clientX, ev.clientY)?.closest(".dg-tile:not(.dg-add)")
+                    const next = over?.parentElement === gallery && over !== tile ? over : null
+                    if (next === target) return
+                    target?.classList.remove("dg-over")
+                    target = next
+                    target?.classList.add("dg-over")
+                }
+                const up = () => {
+                    tile.removeEventListener("pointermove", move)
+                    tile.removeEventListener("pointerup", up)
+                    tile.removeEventListener("pointercancel", up)
+                    tile.classList.remove("dg-dragging")
+                    target?.classList.remove("dg-over")
+                    if (!moved) {
+                        editPicture(entry.image, entry.edit, (edit) => {
+                            const list = entries()
+                            list[i].edit = edit
+                            save(list)
+                        })
+                    } else if (target) {
+                        const list = entries()
+                        list.splice([...gallery.children].indexOf(target), 0, ...list.splice(i, 1))
+                        save(list)
+                    }
+                }
+                tile.addEventListener("pointermove", move)
+                tile.addEventListener("pointerup", up)
+                tile.addEventListener("pointercancel", up)
             })
             gallery.append(tile)
         })
