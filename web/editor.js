@@ -65,8 +65,8 @@ const LAYERS = ["paint", "mask"]
 
 const HELP = {
     crop: "Frame edges: crop or pad (Shift: keep ratio, Alt: from center) · Inside: move · Outside: rotate (Shift: 15° steps)",
-    brush: "Alt+wheel: size · Shift+wheel: opacity · Ctrl+wheel: hardness · M: mask/paint · Q: mask preview · Shift+Q: show/hide mask",
-    eraser: "Alt+wheel: size · Shift+wheel: opacity · Ctrl+wheel: hardness · M: mask/paint · Q: mask preview · Shift+Q: show/hide mask",
+    brush: "Alt+wheel: size · Shift+wheel: opacity · Ctrl+wheel: hardness · M: mask/paint · Q: mask preview · Shift+Q: show/hide mask · Ctrl+I: invert mask",
+    eraser: "Alt+wheel: size · Shift+wheel: opacity · Ctrl+wheel: hardness · M: mask/paint · Q: mask preview · Shift+Q: show/hide mask · Ctrl+I: invert mask",
     hand: "Drag: pan",
 }
 
@@ -164,7 +164,6 @@ async function fetchPreview(image, edit) {
 
 // A recipe runs one node on the picture: {name, node, inputs}, with the picture as its "image"
 // input. user/default/davcha_editor/recipes.json can add recipes or replace these by name.
-// Recipes whose node isn't installed are left out.
 const DEFAULT_RECIPES = [
     { name: "Edges (Canny)", node: "Canny", inputs: { low_threshold: 0.4, high_threshold: 0.8 } },
     { name: "Depth (Depth Anything V2)", node: "AIO_Preprocessor", inputs: { preprocessor: "DepthAnythingV2Preprocessor", resolution: 1024 } },
@@ -181,7 +180,7 @@ async function loadRecipes() {
     const recipes = new Map(DEFAULT_RECIPES.map((r) => [r.name, r]))
     const res = await api.fetchApi(`/userdata/${encodeURIComponent("davcha_editor/recipes.json")}`)
     if (res.ok) for (const r of await res.json()) recipes.set(r.name, r)
-    return [...recipes.values()].filter((r) => LiteGraph.registered_node_types[r.node])
+    return [...recipes.values()]
 }
 
 // Queues a three-node prompt (load the picture, run the recipe, preview the result) like the Run
@@ -321,7 +320,7 @@ class Editor {
     <label>Size <input class="de-size-input" type="number" min="1" max="2000"></label>
     <label>Opacity <input class="de-opacity" type="number" min="1" max="100"></label>
     <label>Hardness <input class="de-hardness" type="number" min="0" max="100"></label>
-    <button data-action="clear" title="Clear the current layer">Clear</button>
+    <button data-action="clear" title="Clear the current layer">Clear</button><button data-action="invert" title="Invert the mask (Ctrl+I)">Invert mask</button>
     <span class="de-sep"></span>
     <label><input class="de-show-mask" type="checkbox"> Show mask</label>
     <select class="de-mask-view" title="Mask preview (Q)">${MASK_VIEWS.map((v) => `<option>${v}</option>`).join("")}</select>
@@ -366,7 +365,15 @@ class Editor {
         loadRecipes()
             .then((recipes) => {
                 this.recipes = recipes
-                for (const recipe of recipes) add.append(new Option(recipe.name))
+                // A recipe whose node isn't installed, or failed to load, shows which one it needs.
+                for (const recipe of recipes) {
+                    const option = new Option(recipe.name, recipe.name)
+                    if (!LiteGraph.registered_node_types[recipe.node]) {
+                        option.disabled = true
+                        option.textContent += ` (needs ${recipe.node})`
+                    }
+                    add.append(option)
+                }
             })
             .catch(showError)
         add.addEventListener("change", () => {
@@ -381,6 +388,7 @@ class Editor {
             else if (target) this.setTarget(target)
             else if (action === "cw" || action === "ccw") this.quarterTurn(action === "cw")
             else if (action === "clear") this.clearLayer()
+            else if (action === "invert") this.invertMask()
             else if (action === "undo") this.undo()
             else if (action === "redo") this.redo()
             else if (action === "reset") this.reset()
@@ -756,6 +764,18 @@ class Editor {
         }
     }
 
+    // XOR with opaque white turns every alpha a into 1 - a, soft edges included.
+    invertMask() {
+        const mask = this.layers.mask
+        const done = this.recordLayer("mask", 0, 0, this.W, this.H)
+        mask.ctx.globalCompositeOperation = "xor"
+        mask.ctx.fillStyle = "#ffffff"
+        mask.ctx.fillRect(0, 0, this.W, this.H)
+        mask.ctx.globalCompositeOperation = "source-over"
+        done(true)
+        this.redraw()
+    }
+
     clearLayer() {
         const layer = this.layers[this.target]
         const done = this.recordLayer(this.target, 0, 0, this.W, this.H)
@@ -1077,6 +1097,10 @@ class Editor {
         } else if (e.ctrlKey && key === "z") {
             e.preventDefault()
             this.undo()
+        } else if (e.ctrlKey && key === "i") {
+            e.preventDefault()
+            this.invertMask()
+            this.showHud("Mask inverted")
         } else if (!e.ctrlKey && !e.altKey && !e.metaKey) {
             const tool = { c: "crop", b: "brush", e: "eraser", h: "hand" }[key]
             if (tool) this.setTool(tool)
