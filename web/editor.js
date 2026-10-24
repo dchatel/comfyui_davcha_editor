@@ -67,7 +67,7 @@ const HELP = {
     crop: "Frame edges: crop or pad (Shift: keep ratio, Alt: from center) · Inside: move · Outside: rotate (Shift: 15° steps)",
     brush: "Alt+wheel: size · Shift+wheel: opacity · Ctrl+wheel: hardness · M: mask/paint · Q: mask preview · Shift+Q: show/hide mask · Ctrl+I: invert mask",
     eraser: "Alt+wheel: size · Shift+wheel: opacity · Ctrl+wheel: hardness · M: mask/paint · Q: mask preview · Shift+Q: show/hide mask · Ctrl+I: invert mask",
-    pose: "Drag a joint to move it (hands and face follow), a limb to move the person · Del: delete the selected person",
+    pose: "Click a point, a limb for the whole person · Ctrl+click: add or remove · Ctrl+drag: select in a box (Shift: add) · Ctrl+A: all · R: move/rotate (Shift: 15° steps) · Del: delete person",
     hand: "Drag: pan",
 }
 
@@ -245,6 +245,8 @@ async function runRecipe(image, recipe) {
 const POSE_LIMBS = [[1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8], [8, 9], [9, 10], [1, 11], [11, 12], [12, 13], [1, 0], [0, 14], [14, 16], [0, 15], [15, 17]]
 const POSE_COLORS = [[255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0], [170, 255, 0], [85, 255, 0], [0, 255, 0], [0, 255, 85], [0, 255, 170], [0, 255, 255], [0, 170, 255], [0, 85, 255], [0, 0, 255], [85, 0, 255], [170, 0, 255], [255, 0, 255], [255, 0, 170], [255, 0, 85]]
 const HAND_EDGES = [[0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8], [0, 9], [9, 10], [10, 11], [11, 12], [0, 13], [13, 14], [14, 15], [15, 16], [0, 17], [17, 18], [18, 19], [19, 20]]
+// Each body point's parent, from the neck out; the eyes hang from the nose and the ears from the eyes.
+const POSE_PARENT = [1, null, 1, 2, 3, 1, 5, 6, 1, 8, 9, 1, 11, 12, 0, 0, 14, 15]
 // The part that moves along with a body point: hands with their wrist, the face with the nose.
 const POSE_ATTACHED = { 4: "rightHand", 7: "leftHand", 0: "face" }
 // A standing person facing the viewer, in a 1×1 box.
@@ -387,9 +389,11 @@ class Editor {
         this.mouse = null
         this.hud = null
         this.sizeNotches = 0
-        this.posePerson = null
+        // Selected body points of the pose layer, as "person:joint".
+        this.poseSel = new Set()
         this.poseHover = null
         this.build()
+        this.setPoseMode("move")
         this.setTool("crop")
         this.fit()
     }
@@ -414,7 +418,8 @@ class Editor {
     <label>Fill <input class="de-fill" type="color"></label>
   </span>
   <span class="de-options" data-for="pose">
-    <button data-action="add-person" title="Add a standing person, in a new pose layer if there is none">Add person</button><button data-action="delete-person" title="Delete the selected person (Del)">Delete person</button>
+    <button data-pose-mode="move" title="Drag moves the selected points (R)">Move</button><button data-pose-mode="rotate" title="Drag turns the selected points about their nearest unselected common parent (R)">Rotate</button>
+    <button data-action="add-person" title="Add a standing person, in a new pose layer if there is none">Add person</button><button data-action="delete-person" title="Delete the people with selected points (Del)">Delete person</button>
   </span>
   <span class="de-options" data-for="brush eraser">
     <button data-target="mask" title="Paint on the mask (M)">Mask</button><button data-target="paint" title="Paint on the picture (M)">Paint</button>
@@ -490,8 +495,9 @@ class Editor {
         })
 
         this.root.querySelector(".de-bar").addEventListener("click", (e) => {
-            const { action, tool, target } = e.target.dataset ?? {}
+            const { action, tool, target, poseMode } = e.target.dataset ?? {}
             if (tool) this.setTool(tool)
+            else if (poseMode) this.setPoseMode(poseMode)
             else if (target) this.setTarget(target)
             else if (action === "cw" || action === "ccw") this.quarterTurn(action === "cw")
             else if (action === "clear") this.clearLayer()
@@ -596,6 +602,13 @@ class Editor {
         for (const b of this.root.querySelectorAll("[data-target]")) b.classList.toggle("de-active", b.dataset.target === target)
         this.inputs.color.style.display = target === "mask" ? "none" : ""
         this.renderLayers()
+    }
+
+    setPoseMode(mode) {
+        this.poseMode = mode
+        for (const b of this.root.querySelectorAll("[data-pose-mode]")) b.classList.toggle("de-active", b.dataset.poseMode === mode)
+        this.updateCursor()
+        this.redrawOverlay()
     }
 
     // A recipe layer: its result stretched over the picture, which is where the recipe ran. A pose
@@ -786,7 +799,10 @@ class Editor {
         else if (this.tool === "crop" && this.mouse) this.canvas.style.cursor = CURSORS[this.hit(...this.mouse)]
         else if (this.tool === "pose") {
             this.poseHover = this.mouse && !this.drag ? this.hitPose(...this.mouse) : null
-            this.canvas.style.cursor = this.drag ? "grabbing" : !this.poseHover ? "default" : this.poseHover.joint === null ? "move" : "grab"
+            const turning = this.poseMode === "rotate" && (this.poseHover || this.poseSel.size)
+            if (turning) this.canvas.style.cursor = CURSORS.rotate
+            else if (this.drag) this.canvas.style.cursor = this.drag.mode === "marquee" ? "crosshair" : "grabbing"
+            else this.canvas.style.cursor = !this.poseHover ? "default" : this.poseHover.joint === null ? "move" : "grab"
         }
         else this.canvas.style.cursor = "default"
     }
@@ -1024,9 +1040,21 @@ class Editor {
             mode = "stroke"
         } else if (e.button === 0 && this.tool === "pose") {
             hit = this.hitPose(sx, sy)
-            this.posePerson = hit?.person ?? null
+            const key = hit && hit.joint !== null && `${hit.person}:${hit.joint}`
             this.redrawOverlay()
-            if (hit) mode = "pose"
+            if (e.ctrlKey && key) {
+                if (this.poseSel.has(key)) this.poseSel.delete(key)
+                else this.poseSel.add(key)
+                return
+            }
+            if (e.ctrlKey) mode = "marquee"
+            else {
+                // A click on a point keeps a selection it belongs to, so the selection drags as one.
+                if (hit && !(key && this.poseSel.has(key))) this.selectPose(hit)
+                // In Rotate mode, a drag from anywhere turns the selection.
+                if (hit || (this.poseMode === "rotate" && this.poseSel.size)) mode = "pose"
+                else this.poseSel.clear()
+            }
         }
         if (!mode) return
         e.preventDefault()
@@ -1035,7 +1063,7 @@ class Editor {
         if (mode === "stroke") this.startStroke(this.toPicture(sx, sy))
         if (mode === "pose") {
             const layer = this.poseLayer()
-            this.drag.pose = { layer, before: layer.pose, joint: hit.joint, last: this.toPicture(sx, sy), moved: false }
+            this.drag.pose = { layer, before: layer.pose, start: this.toPicture(sx, sy), moved: false }
             layer.pose = structuredClone(layer.pose)
         }
         this.updateCursor()
@@ -1058,13 +1086,31 @@ class Editor {
             return
         }
         if (d.mode === "pose") {
-            const p = this.toPicture(sx, sy)
-            const { layer, joint, last } = d.pose
-            this.movePose(layer.pose[this.posePerson], joint, p[0] - last[0], p[1] - last[1])
-            d.pose.last = p
+            // Each move starts again from the pose before the drag, so a rotation doesn't drift.
+            const [x, y] = this.toPicture(sx, sy)
+            const { layer, before, start } = d.pose
+            layer.pose = structuredClone(before)
+            for (const [person, joints] of this.poseSelection()) {
+                let move
+                if (this.poseMode === "rotate") {
+                    const [px, py] = this.posePivot(before[person], joints)
+                    let a = Math.atan2(y - py, x - px) - Math.atan2(start[1] - py, start[0] - px)
+                    if (e.shiftKey) a = Math.round(a / (Math.PI / 12)) * (Math.PI / 12)
+                    const c = Math.cos(a)
+                    const s = Math.sin(a)
+                    move = ([u, v]) => [px + c * (u - px) - s * (v - py), py + s * (u - px) + c * (v - py)]
+                } else {
+                    move = ([u, v]) => [u + x - start[0], v + y - start[1]]
+                }
+                this.transformJoints(layer.pose[person], joints, move)
+            }
             d.pose.moved = true
             drawPoses(layer.ctx, layer.pose, this.W, this.H)
             this.redraw()
+            return
+        }
+        if (d.mode === "marquee") {
+            this.redrawOverlay()
             return
         }
         if (d.mode === "pan") {
@@ -1115,8 +1161,76 @@ class Editor {
         if (d.mode === "stroke") this.endStroke()
         else if (d.mode === "pose") {
             if (d.pose.moved) this.pushPose(d.pose.layer, d.pose.before)
-        } else if (d.mode !== "pan") this.pushCrop(d.crop)
+            else {
+                // A click without a drag picks what's under it alone, or nothing away from the pose.
+                const hit = this.hitPose(d.sx, d.sy)
+                if (hit) this.selectPose(hit)
+                else this.poseSel.clear()
+            }
+        } else if (d.mode === "marquee") this.selectInBox(d.sx, d.sy, ...this.pos(e), e.shiftKey)
+        else if (d.mode !== "pan") this.pushCrop(d.crop)
         this.onMove(e)
+    }
+
+    selectInBox(x0, y0, x1, y1, add) {
+        if (!add) this.poseSel.clear()
+        const [l, r, t, b] = [Math.min(x0, x1), Math.max(x0, x1), Math.min(y0, y1), Math.max(y0, y1)]
+        for (const [i, person] of (this.poseLayer()?.pose ?? []).entries()) {
+            person.body.forEach((p, j) => {
+                if (!p) return
+                const [x, y] = this.fromPicture(...p)
+                if (x >= l && x <= r && y >= t && y <= b) this.poseSel.add(`${i}:${j}`)
+            })
+        }
+    }
+
+    // A point alone, or for a limb (joint null) every point of its person.
+    selectPose({ person, joint }) {
+        this.poseSel.clear()
+        const body = this.poseLayer().pose[person].body
+        for (const [j, p] of body.entries()) if (p && (joint === null || j === joint)) this.poseSel.add(`${person}:${j}`)
+    }
+
+    // The selection as [person, joints] pairs, without points that no longer exist.
+    poseSelection() {
+        const people = this.poseLayer()?.pose ?? []
+        const byPerson = new Map()
+        for (const key of this.poseSel) {
+            const [person, joint] = key.split(":").map(Number)
+            if (!people[person]?.body[joint]) continue
+            if (!byPerson.has(person)) byPerson.set(person, [])
+            byPerson.get(person).push(joint)
+        }
+        return byPerson
+    }
+
+    // The nearest common parent of the points that isn't selected itself, skipping parents the
+    // detection missed. Without one, such as for a whole person, the selection's center.
+    posePivot(person, joints) {
+        const chain = (j) => {
+            const up = []
+            for (; j !== null; j = POSE_PARENT[j]) up.push(j)
+            return up
+        }
+        let common = chain(joints[0])
+        for (const j of joints.slice(1)) {
+            const up = new Set(chain(j))
+            common = common.filter((a) => up.has(a))
+        }
+        let pivot = joints.includes(common[0]) ? POSE_PARENT[common[0]] : common[0]
+        while (pivot !== null && !person.body[pivot]) pivot = POSE_PARENT[pivot]
+        if (pivot !== null) return person.body[pivot]
+        const points = joints.map((j) => person.body[j])
+        return [points.reduce((s, p) => s + p[0], 0) / points.length, points.reduce((s, p) => s + p[1], 0) / points.length]
+    }
+
+    // Applies move to the selected body points and to the hand or face attached to each.
+    transformJoints(person, joints, move) {
+        for (const j of joints) {
+            person.body[j] = move(person.body[j])
+            const part = person[POSE_ATTACHED[j]]
+            if (part) person[POSE_ATTACHED[j]] = part.map((p) => p && move(p))
+        }
     }
 
     // The pose layer the Pose tool edits: the selected layer, or else the top pose layer.
@@ -1156,23 +1270,6 @@ class Editor {
         return null
     }
 
-    // Moves a body point with the part attached to it, or the whole person when joint is null.
-    movePose(person, joint, dx, dy) {
-        const shift = (points) => {
-            for (const p of points ?? []) {
-                if (!p) continue
-                p[0] += dx
-                p[1] += dy
-            }
-        }
-        if (joint === null) {
-            for (const part of ["body", "leftHand", "rightHand", "face"]) shift(person[part])
-            return
-        }
-        shift([person.body[joint]])
-        shift(person[POSE_ATTACHED[joint]])
-    }
-
     // Without a pose layer, makes one: a pose can be posed from scratch.
     addPerson() {
         let layer = this.poseLayer()
@@ -1183,14 +1280,16 @@ class Editor {
             this.push({ undo: () => this.removeLayer(layer.id), redo: () => this.insertLayer(layer, index) })
         }
         this.setPose(layer, [...layer.pose, defaultPerson(this.W, this.H)])
-        this.posePerson = layer.pose.length - 1
+        this.selectPose({ person: layer.pose.length - 1, joint: null })
     }
 
+    // Deletes every person with a selected point.
     deletePerson() {
+        const people = this.poseSelection()
+        if (!people.size) return
         const layer = this.poseLayer()
-        if (!layer?.pose[this.posePerson]) return
-        this.setPose(layer, layer.pose.filter((_, i) => i !== this.posePerson))
-        this.posePerson = null
+        this.setPose(layer, layer.pose.filter((_, i) => !people.has(i)))
+        this.poseSel.clear()
     }
 
     // A stroke is drawn as a coverage map: opaque gray dabs on black, merged with "lighten" so
@@ -1340,6 +1439,10 @@ class Editor {
         } else if (e.ctrlKey && key === "z") {
             e.preventDefault()
             this.undo()
+        } else if (e.ctrlKey && key === "a" && this.tool === "pose") {
+            e.preventDefault()
+            this.selectInBox(-Infinity, -Infinity, Infinity, Infinity, false)
+            this.redrawOverlay()
         } else if (e.ctrlKey && key === "i") {
             e.preventDefault()
             this.invertMask()
@@ -1348,6 +1451,10 @@ class Editor {
             const tool = { c: "crop", b: "brush", e: "eraser", p: "pose", h: "hand" }[key]
             if (tool) this.setTool(tool)
             else if (this.tool === "pose" && (e.key === "Delete" || e.key === "Backspace")) this.deletePerson()
+            else if (this.tool === "pose" && key === "r") {
+                this.setPoseMode(this.poseMode === "move" ? "rotate" : "move")
+                this.showHud(this.poseMode === "move" ? "Move" : "Rotate")
+            }
             else if (key === "m") this.setTarget(this.target === "mask" ? "paint" : "mask")
             else if (key === "q" && e.shiftKey) {
                 this.setShowMask(!this.showMask)
@@ -1474,21 +1581,46 @@ class Editor {
             }
         }
 
-        // Pose handles: one dot per body point, outlined in white for the selected person.
+        // Pose handles: one dot per body point, ringed in white when selected. In Rotate mode, a
+        // cross marks the point each selection turns about.
         if (this.tool === "pose") {
-            for (const [i, person] of (this.poseLayer()?.pose ?? []).entries()) {
+            const people = this.poseLayer()?.pose ?? []
+            for (const [i, person] of people.entries()) {
                 person.body.forEach((p, j) => {
                     if (!p) return
                     const [x, y] = this.fromPicture(...p)
                     const hovered = this.poseHover?.person === i && this.poseHover.joint === j
+                    const selected = this.poseSel.has(`${i}:${j}`)
                     ctx.fillStyle = rgb(POSE_COLORS[j])
-                    ctx.strokeStyle = i === this.posePerson ? "#ffffff" : "rgba(0, 0, 0, 0.8)"
-                    ctx.lineWidth = i === this.posePerson ? 2 : 1
+                    ctx.strokeStyle = selected ? "#ffffff" : "rgba(0, 0, 0, 0.8)"
+                    ctx.lineWidth = selected ? 2.5 : 1
                     ctx.beginPath()
-                    ctx.arc(x, y, hovered ? 7 : 5, 0, Math.PI * 2)
+                    ctx.arc(x, y, hovered || selected ? 7 : 5, 0, Math.PI * 2)
                     ctx.fill()
                     ctx.stroke()
                 })
+            }
+            if (this.poseMode === "rotate") {
+                const before = this.drag?.pose?.before ?? people
+                for (const [person, joints] of this.poseSelection()) {
+                    const [x, y] = this.fromPicture(...this.posePivot(before[person], joints))
+                    ctx.strokeStyle = "#ffffff"
+                    ctx.lineWidth = 2
+                    ctx.beginPath()
+                    ctx.arc(x, y, 9, 0, Math.PI * 2)
+                    ctx.moveTo(x - 14, y)
+                    ctx.lineTo(x + 14, y)
+                    ctx.moveTo(x, y - 14)
+                    ctx.lineTo(x, y + 14)
+                    ctx.stroke()
+                }
+            }
+            if (this.drag?.mode === "marquee" && this.mouse) {
+                ctx.strokeStyle = "#ffffff"
+                ctx.lineWidth = 1
+                ctx.setLineDash([4, 4])
+                ctx.strokeRect(this.drag.sx, this.drag.sy, this.mouse[0] - this.drag.sx, this.mouse[1] - this.drag.sy)
+                ctx.setLineDash([])
             }
             ctx.lineWidth = 1
         }
