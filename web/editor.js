@@ -2158,8 +2158,8 @@ app.registerExtension({
                 return result
             }
             // Read by For Each (comfyui_davcha_controlflow) to show one table row per picture.
-            nodeType.prototype.getListItems = function () {
-                return JSON.parse(this.widgets.find((w) => w.name === "images").value || "[]").map((entry) => entry.image)
+            nodeType.prototype.getListLength = function () {
+                return JSON.parse(this.widgets.find((w) => w.name === "images").value || "[]").length
             }
             return
         }
