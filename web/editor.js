@@ -2157,6 +2157,10 @@ app.registerExtension({
                 this.renderGallery()
                 return result
             }
+            // Read by For Each (comfyui_davcha_controlflow) to show one table row per picture.
+            nodeType.prototype.getListItems = function () {
+                return JSON.parse(this.widgets.find((w) => w.name === "images").value || "[]").map((entry) => entry.image)
+            }
             return
         }
         if (nodeData.name !== "DavchaLoadImageEditor") return
