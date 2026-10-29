@@ -39,8 +39,8 @@ pictures can have different sizes.
 
 - Drop files on the node, or click **+**, to add pictures.
 - Click a picture to edit it. The ✎ badge marks edited pictures.
-- Drag a picture onto another to move it to that place.
-- Hover a picture and click **×** to remove it.
+- Drag a picture to move it: the others slide aside to show where it will land.
+- Hover a picture and click **×** to remove it, or click **Clear** to remove them all.
 - Select the node and press Ctrl+V to add the picture in the clipboard.
 
 ### Pasting into pinned nodes

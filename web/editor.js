@@ -129,8 +129,7 @@ const STYLE = `
 .davcha-gallery { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 6px; padding: 4px; overflow-y: auto; box-sizing: border-box; }
 .davcha-gallery .dg-tile { position: relative; width: 84px; height: 84px; box-sizing: border-box; border: 1px solid #444; border-radius: 4px; overflow: hidden; background: #1b1b1b; cursor: pointer; touch-action: none; }
 .davcha-gallery .dg-tile img { width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
-.davcha-gallery .dg-tile.dg-over { outline: 2px solid #3a70bd; }
-.davcha-gallery .dg-tile.dg-dragging { opacity: 0.4; }
+.davcha-gallery .dg-tile.dg-dragging { z-index: 1; opacity: 0.85; border-color: #3a70bd; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6); cursor: grabbing; }
 .davcha-gallery .dg-badge { position: absolute; left: 2px; bottom: 2px; padding: 0 4px; border-radius: 3px; background: rgba(0, 0, 0, 0.7); color: #fff; font: 10px sans-serif; }
 .davcha-gallery .dg-remove { display: none; position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; border-radius: 9px; background: rgba(0, 0, 0, 0.7); color: #fff; font: 13px/18px sans-serif; text-align: center; }
 .davcha-gallery .dg-tile:hover .dg-remove { display: block; }
@@ -2060,40 +2059,60 @@ function setupGallery(node) {
                 list.splice(i, 1)
                 save(list)
             })
-            // A click edits the picture; a drag moves it to the place of the tile it is dropped on.
+            // A click edits the picture; a drag carries it under the pointer while the other tiles
+            // slide aside, leaving its slot where it will land.
             // Pointer events, as the canvas keeps native drag and drop from starting in node widgets.
             tile.addEventListener("pointerdown", (e) => {
                 if (e.button !== 0 || e.target.closest(".dg-remove")) return
                 e.stopPropagation()
                 tile.setPointerCapture(e.pointerId)
+                const start = tile.getBoundingClientRect()
+                // The node widget is scaled with the canvas zoom.
+                const scale = start.width / tile.offsetWidth
                 let moved = false
-                let target = null
                 const move = (ev) => {
                     if (!moved && Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 5) return
                     moved = true
                     tile.classList.add("dg-dragging")
-                    const over = document.elementFromPoint(ev.clientX, ev.clientY)?.closest(".dg-tile:not(.dg-add)")
-                    const next = over?.parentElement === gallery && over !== tile ? over : null
-                    if (next === target) return
-                    target?.classList.remove("dg-over")
-                    target = next
-                    target?.classList.add("dg-over")
+                    // A tile still sliding aside would swap straight back under the pointer.
+                    const over = document.elementsFromPoint(ev.clientX, ev.clientY).find((el) => el !== tile && el.parentElement === gallery && !el.getAnimations().length)
+                    if (over) {
+                        const others = [...gallery.children].filter((el) => el !== tile)
+                        const before = new Map(others.map((el) => [el, el.getBoundingClientRect()]))
+                        if (over.classList.contains("dg-add")) over.before(tile)
+                        else if (tile.compareDocumentPosition(over) & Node.DOCUMENT_POSITION_FOLLOWING) over.after(tile)
+                        else over.before(tile)
+                        for (const el of others) {
+                            const a = before.get(el)
+                            const b = el.getBoundingClientRect()
+                            if (a.left !== b.left || a.top !== b.top) {
+                                el.animate([{ transform: `translate(${(a.left - b.left) / scale}px, ${(a.top - b.top) / scale}px)` }, { transform: "none" }], { duration: 150, easing: "ease-out" })
+                            }
+                        }
+                        gallery.querySelectorAll(".dg-badge").forEach((badge, j) => (badge.textContent = badge.textContent.replace(/^\d+/, j + 1)))
+                    }
+                    tile.style.transform = ""
+                    const home = tile.getBoundingClientRect()
+                    tile.style.transform = `translate(${(ev.clientX - e.clientX + start.left - home.left) / scale}px, ${(ev.clientY - e.clientY + start.top - home.top) / scale}px)`
                 }
                 const up = () => {
                     tile.removeEventListener("pointermove", move)
                     tile.removeEventListener("pointerup", up)
                     tile.removeEventListener("pointercancel", up)
                     tile.classList.remove("dg-dragging")
-                    target?.classList.remove("dg-over")
+                    tile.style.transform = ""
                     if (!moved) {
                         editPicture(entry.image, entry.edit, (edit) => {
                             const list = entries()
                             list[i].edit = edit
                             save(list)
                         })
-                    } else if (target) {
+                        return
+                    }
+                    const to = [...gallery.children].indexOf(tile)
+                    if (to !== i) {
                         const list = entries()
-                        list.splice([...gallery.children].indexOf(target), 0, ...list.splice(i, 1))
+                        list.splice(to, 0, ...list.splice(i, 1))
                         save(list)
                     }
                 }
@@ -2125,6 +2144,7 @@ function setupGallery(node) {
         addFiles([...e.dataTransfer.files])
     })
     node.addDOMWidget("gallery", "custom", gallery, { serialize: false, getMinHeight: () => 100 })
+    node.addWidget("button", "Clear", null, () => save([]))
     node.onDragOver = (e) => !!e.dataTransfer?.types?.includes("Files")
     node.onDragDrop = (e) => {
         addFiles([...e.dataTransfer.files])
